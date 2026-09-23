@@ -1,0 +1,19 @@
+{
+  "current_city": "New York",
+  "cash": 20000,
+  "debt": 2000,
+  "days_left": 27,
+  "capacity": 100,
+  "no_scent": 10,
+  "prices": {
+    "New York":  {"Cocaine": 15000, "Heroin": 8000,  "Hashish": 600, "Ecstasy": 40,  "Opium": 900},
+    "London":    {"Cocaine": 22000, "Heroin": 6000,  "Hashish": 950, "Ecstasy": 55,  "Opium": 700},
+    "Paris":     {"Cocaine": 18000, "Heroin": 9500,  "Hashish": 400, "Ecstasy": 30,  "Mushrooms": 120},
+    "Miami":     {"Cocaine": 12000, "Heroin": 11000, "Crack": 800,   "Ecstasy": 70},
+    "Moscow":    {"Cocaine": 25000, "Heroin": 7000,  "Opium": 1400,  "Hashish": 500},
+    "Sydney":    {"Cocaine": 19000, "Ecstasy": 90,   "Mushrooms": 200, "Hashish": 700}
+  },
+  "inventory": [
+    {"drug": "Heroin", "qty": 15, "avg_buy": 7000}
+  ]
+}

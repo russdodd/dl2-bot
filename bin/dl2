@@ -1,0 +1,34 @@
+#!/bin/zsh
+# dl2 — Drug Lord 2 trade assistant.
+#   dl2 plan       full sweep of every city/drug -> the single best trade (recommended)
+#   dl2 decide     what to do with your inventory (uses the cached shipping-rate store)
+#   dl2 shiprates  print the persistent origin->dest shipping-rate store + gaps
+#   dl2 decay      projected-vs-realized spike-decay data from the audit log
+#   dl2            quick one-shot reading of the current view
+#   dl2 --watch    live quick reading, refreshes as prices change
+DIR="$(dirname "$0")/.."
+# Pick a Python that has the deps (PIL + numpy for the digit-template reader).
+# The system /usr/bin/python3 has neither; the user's default python3 (anaconda)
+# has both. Prefer whichever import succeeds.
+pick_py() {
+  for py in python3 /Users/russelldodd/anaconda3/bin/python3 /usr/bin/python3; do
+    if command -v "$py" >/dev/null 2>&1 && \
+       "$py" -c 'import PIL, numpy' >/dev/null 2>&1; then
+      echo "$py"; return
+    fi
+  done
+  echo python3   # last resort (base tool still runs; digit reader self-disables)
+}
+PY="$(pick_py)"
+case "$1" in
+  plan) exec "$PY" "$DIR/dl2sweep.py" "${@:2}" ;;
+  buy)  exec "$PY" "$DIR/dl2sweep.py" buy "${@:2}" ;;
+  sell) exec "$PY" "$DIR/dl2sweep.py" sell "${@:2}" ;;
+  decide) exec "$PY" "$DIR/dl2sweep.py" decide "${@:2}" ;;
+  audit) exec "$PY" "$DIR/audit.py" "${@:2}" ;;
+  newgame) exec "$PY" "$DIR/audit.py" newgame "${@:2}" ;;
+  shiprates) exec "$PY" "$DIR/shiprates.py" "${@:2}" ;;
+  decay) exec "$PY" "$DIR/decay.py" "${@:2}" ;;
+  ship) exec "$PY" "$DIR/dl2sweep.py" ship "${@:2}" ;;
+  *)    exec "$PY" "$DIR/dl2.py" "$@" ;;
+esac
