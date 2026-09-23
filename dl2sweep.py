@@ -31,6 +31,7 @@ from dl2model import shipping as _shipping   # exact shipping cost + failure EV
 from dl2model import stock as _stock         # remote-stock estimate
 from dl2model import finance as _finance     # rank -> capacity
 from dl2model import risk as _risk           # carry-vs-ship channel advisory
+from dl2model import combat as _combat       # bank dominance + airport bust-loss
 from dl2model import constants as _C
 try:
     import digits                       # exact fixed-font digit reader (needs numpy)
@@ -1042,9 +1043,16 @@ def decide_main():
         if chan and chan.get("carry"):
             c = chan["carry"]
             sev = chan.get("ship", {}).get("expected_value")
-            print(f"    carry: {c['cans_used']}/{c['cans_needed']} No-Scent cans, "
-                  f"detection prob {c['detection_prob']:.2%} "
-                  f"(bust loss UNKNOWN — combat resolution undecoded).")
+            bl = c.get("bust_loss")
+            if bl is not None:
+                exp_loss = c["detection_prob"] * bl
+                print(f"    carry: {c['cans_used']}/{c['cans_needed']} No-Scent cans, "
+                      f"detection prob {c['detection_prob']:.2%}; if busted you lose "
+                      f"~${bl:,.0f} of goods (cash & bank are safe).")
+                print(f"    expected carry loss ≈ detection×goods = ${exp_loss:,.0f}.")
+            else:
+                print(f"    carry: {c['cans_used']}/{c['cans_needed']} No-Scent cans, "
+                      f"detection prob {c['detection_prob']:.2%}.")
             if sev is not None:
                 print(f"    ship:  EV ${sev:,.0f} (delivery-failure priced in).")
 
@@ -1061,6 +1069,18 @@ def decide_main():
               f"(${b['inv_net']:,.0f} inventory + ${b['arb_net']:,.0f} buy-arb).")
     print("  POTENTIAL, not a lock: spikes usually last 3+ days (favorable) but you")
     print("  can't confirm the destination trades your drugs until you land.")
+
+    # ---------- banking advisory (combat: bank is risk-free) ----------
+    # Banked cash is never stolen/confiscated/surrendered and rank keys off
+    # cash+bank, so any cash beyond what the recommended buys need is strictly
+    # safer in the bank. planned spend = the cost of the top plan's buy-arb.
+    if cash is not None and dests and dests[0].get("arb"):
+        planned_spend = sum(u * buy for (_d, u, buy, _s, _p) in dests[0]["arb"])
+        surplus = _combat.recommended_deposit(cash, planned_spend)
+        if surplus > 0:
+            print(f"• Bank ${surplus:,}: only ~${planned_spend:,} is needed for the "
+                  f"recommended buys; the rest is safer banked (never stolen/")
+            print(f"  confiscated, and cash+bank still counts toward rank).")
 
     # --- audit trail: log this PROJECTION so we can later compare it to outcomes ---
     held_spikes = []
@@ -1431,14 +1451,16 @@ def estimate_remote_stock(observed_price, drug, city, rank):
 def channel_advice(units, unit_value, no_scent, origin, dest,
                    shipper=DEFAULT_SHIPPER, days=DEFAULT_SHIP_DAYS):
     """Carry-vs-ship advisory for the chosen load (risk.channel_recommendation).
-    Combat-loss magnitude is UNKNOWN in the model, so bust_cost_hook stays None
-    and the carry side reports the No-Scent detection probability only. Advisory
-    only — never changes the default ship action. Returns None on unknown city."""
+    The airport bust-loss is now modelled by combat.bust_cost_hook_for_risk()
+    (detection ⇒ the carried goods are lost in ~every resolution; bank is safe),
+    so the carry side reports both the detection probability AND the expected
+    dollar loss. Advisory only — never changes the default ship action. Returns
+    None on unknown city."""
     try:
         return _risk.channel_recommendation(
             units=units, unit_value=unit_value, cans_available=(no_scent or 0),
             origin=origin, dest=dest, shipper=shipper, days=days,
-            bust_cost_hook=None)
+            bust_cost_hook=_combat.bust_cost_hook_for_risk())
     except Exception:
         return None
 

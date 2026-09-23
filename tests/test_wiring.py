@@ -169,16 +169,17 @@ def test_remote_stock_estimate():
 
 
 # --- integration point 5: carry-vs-ship channel advisory --------------------
-def test_channel_advice_reports_detection_prob_not_a_guess():
+def test_channel_advice_reports_detection_prob_and_bust_loss():
     adv = dl2sweep.channel_advice(units=500, unit_value=10000, no_scent=5,
                                   origin="Boston", dest="New York")
     assert adv is not None
     carry = adv["carry"]
     # 5 cans fully cover 500 units -> near-floor detection probability
     assert carry["detection_prob"] == pytest.approx(0.0099, abs=1e-4)
-    # combat-loss magnitude is UNKNOWN -> reported as unknown, never invented
-    assert carry["bust_loss_known"] is False
-    assert carry["bust_loss"] is None
+    # combat decode landed: airport detection loses the carried goods in ~every
+    # resolution, so the bust loss is now known (~= units*unit_value), not None.
+    assert carry["bust_loss_known"] is True
+    assert carry["bust_loss"] == 500 * 10000
     # ship side prices the delivery-failure in
     assert adv["ship"]["expected_value"] is not None
 
