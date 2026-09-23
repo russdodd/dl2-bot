@@ -99,6 +99,59 @@ def is_fresh(entry, current_day=None, now=None):
     return (now - _entry_epoch(entry)) <= MAXAGE_HOURS * 3600
 
 
+# --------------------------------------------------------------------------- #
+# Exact-model cross-check / fill (dl2model.shipping). The measured live rate
+# stays authoritative; the model only FILLS a rate we couldn't measure and
+# FLAGS a measured rate that disagrees. Never overrides a measured value.
+# --------------------------------------------------------------------------- #
+# The store holds the rate the bot actually uses: International Couriers,
+# overnight (see dl2sweep.DEFAULT_SHIPPER / measure_ship_rates).
+MODEL_SHIPPER = "International Couriers"
+MODEL_SHIP_DAYS = 1
+
+
+def model_per_unit_rate(origin, dest, shipper=MODEL_SHIPPER, days=MODEL_SHIP_DAYS):
+    """Exact per-unit shipping rate from the decompiled model
+    (dl2model.shipping.per_unit_rate). SHORT city names. Returns None if a city
+    isn't in the model tables (never raises — a store helper must not break a
+    trade)."""
+    try:
+        from dl2model import shipping
+        return shipping.per_unit_rate(origin, dest, shipper, days)
+    except Exception:
+        return None
+
+
+def rate_discrepancy(origin, dest, measured, shipper=MODEL_SHIPPER,
+                     days=MODEL_SHIP_DAYS, tol=1.0):
+    """Compare a MEASURED $/unit rate to the exact model. Returns
+    {origin,dest,measured,model,delta,shipper,days} when |measured-model| > tol,
+    else None. Advisory: the caller logs it (a `rate_check`-style event); the
+    measured value stays authoritative."""
+    model = model_per_unit_rate(origin, dest, shipper, days)
+    if model is None or measured is None:
+        return None
+    delta = measured - model
+    if abs(delta) <= tol:
+        return None
+    return {"origin": origin, "dest": dest, "measured": round(measured, 2),
+            "model": round(model, 2), "delta": round(delta, 2),
+            "shipper": shipper, "days": days}
+
+
+def fill_missing_from_model(origin, missing, shipper=MODEL_SHIPPER,
+                            days=MODEL_SHIP_DAYS):
+    """Model per-unit rates for destinations we couldn't measure. Returns
+    {dest: rate} for the ones the model knows (SHORT names). These are ESTIMATES
+    — label them as such; they do NOT get written to the measured store."""
+    out = {}
+    for d in missing:
+        r = model_per_unit_rate(origin, d, shipper, days)
+        if r is not None:
+            out[d] = r
+    return out
+
+
 def fresh_rates_for(origin, dests, current_day=None, rates=None):
     """Split `dests` by what we already know. Returns (have, missing):
     have = {dest: rate} for dests with a FRESH cached rate; missing = the rest
