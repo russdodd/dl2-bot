@@ -73,15 +73,34 @@ def test_expected_mugging_loss_partial_cap():
     assert combat.expected_mugging_loss(cash) == pytest.approx(expected)
 
 
-def test_airport_bust_loss_cash_tail_is_small():
-    base = combat.airport_bust_loss(200, 5000)                 # cash=0 default
-    with_cash = combat.airport_bust_loss(200, 5000, cash=1_000_000)
-    assert base == pytest.approx(200 * 5000)
-    assert with_cash > base                                    # tail present
-    # Tail is a minority pocket-cash effect, not a second inventory loss.
-    assert with_cash - base == pytest.approx(
-        combat._AIRPORT_FLEE_ESCAPE_FRAC * (1_000_000 - 50))
-    assert combat.airport_bust_loss(200, 5000, cash=10) == pytest.approx(200 * 5000)
+def test_airport_bust_loss_surrender_ignores_cash():
+    # Surrender (default & recommended): drugs lost, cash untouched. Cash arg
+    # has no effect on the surrender branch.
+    for cash in (0, 10, 1_000_000):
+        assert combat.airport_bust_loss(200, 5000, cash=cash) == pytest.approx(200 * 5000)
+
+
+def test_airport_bust_loss_run_caps_cash_at_50():
+    # A successful Run clears drugs AND caps pocket cash at $50.
+    assert combat.airport_bust_loss(200, 5000, cash=0, policy="run") == 200 * 5000
+    assert combat.airport_bust_loss(200, 5000, cash=50, policy="run") == 200 * 5000
+    assert combat.airport_bust_loss(200, 5000, cash=1_000_000, policy="run") == (
+        200 * 5000 + (1_000_000 - 50))
+
+
+def test_airport_bust_loss_rejects_unknown_policy():
+    with pytest.raises(ValueError):
+        combat.airport_bust_loss(200, 5000, policy="bribe")
+
+
+def test_decoded_action_probabilities_are_exact():
+    # Exact RNG thresholds decoded from druglord2.exe (32,768-output rand()).
+    assert combat.SURRENDER_ACCEPT_LAW == 6005 / 8192
+    assert combat.SURRENDER_ACCEPT_LAW == pytest.approx(0.7330322265625)
+    assert combat.AIRPORT_RUN_ESCAPE_PROB == 3277 / 32768
+    assert combat.AIRPORT_RUN_ESCAPE_PROB == pytest.approx(0.100006103515625)
+    assert combat.BRIBE_ACCEPT_AIRPORT == 650 / 32768
+    assert combat.AIRPORT_RUN_CASH_CAP == 50
 
 
 def test_daily_carry_risk_matches_formula():

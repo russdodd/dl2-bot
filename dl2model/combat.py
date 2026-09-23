@@ -30,9 +30,35 @@ from . import risk
 
 
 # --- local constants (kept here so constants.py stays frozen) --------------
+#
+# Airport detection does NOT auto-resolve to a fixed bust outcome. Detection
+# opens the normal combat dialog against the special "airport security" opponent
+# (index 9), and the PLAYER picks Surrender / Run / Bribe / Fight. The constants
+# below are the exact decoded RNG thresholds for those actions (from the
+# druglord2.exe disassembly). All are expressed as exact rationals over the
+# 32,768-output MSVC rand() space, so they carry the real modulo bias rather than
+# the idealized round number.
 
-#: Probability a law-enforcement surrender is accepted (drugs dropped, cash kept).
-SURRENDER_ACCEPT_LAW = 0.7330
+#: P(law-enforcement surrender accepted): rand()%101 draws value 1..74 -> 24020
+#: of 32768 outputs. On accept: carried drugs cleared, cash & bank UNCHANGED.
+#: = 6005/8192 ≈ 0.7330322265625 (the task's "≈0.7330").
+SURRENDER_ACCEPT_LAW = 6005 / 8192
+
+#: P(Run escapes on the FIRST airport attempt): rand()%k == 0 with k = min(
+#: attackers+1, 10). Airport security always starts with >=9 attackers at every
+#: rank, so k == 10 initially -> residue 0 hits 3277 of 32768 outputs.
+#: = 3277/32768 ≈ 0.100006103515625 (biased, not exactly 0.10). On escape:
+#: carried drugs cleared AND cash capped at $50; bank unchanged.
+AIRPORT_RUN_ESCAPE_PROB = 3277 / 32768
+
+#: P(airport-security bribe accepted): rand()%101 <= 1 -> 650 of 32768 outputs.
+#: On accept: drugs KEPT, cash reduced by the bribe amount, bank unchanged.
+#: = 325/16384 ≈ 0.01983642578125.
+BRIBE_ACCEPT_AIRPORT = 650 / 32768
+
+#: Pocket cash is capped at this many $ ONLY on a successful airport Run escape.
+#: Surrender does not touch cash.
+AIRPORT_RUN_CASH_CAP = 50
 
 #: Mugging: 10% of muggings draw the "big" bracket, 90% the "small" bracket.
 _MUG_BIG_PROB = 0.10
@@ -41,15 +67,6 @@ _MUG_SMALL_PROB = 0.90
 _MUG_BIG_MEAN = 1000 + (5000 - 1) / 2.0     # 3499.5
 #: loss = 100 + rand()%500    -> uniform over integers 100..599,  mean 349.5
 _MUG_SMALL_MEAN = 100 + (500 - 1) / 2.0     # 349.5
-
-#: On an airport bust the flee-escape branch caps pocket cash at this many $.
-_AIRPORT_FLEE_CASH_CAP = 50
-#: Fraction of airport-bust resolutions that end in a flee-escape (drugs still
-#: lost, but pocket cash above the cap is also lost). Small: most resolutions are
-#: an accepted surrender to airport security, which keeps cash. This only feeds a
-#: minor pocket-cash tail on top of the (dominant) inventory loss -- see
-#: airport_bust_loss's docstring.
-_AIRPORT_FLEE_ESCAPE_FRAC = 0.10
 
 
 def flee_prob(attackers: int) -> float:
@@ -82,26 +99,44 @@ def expected_mugging_loss(cash: int) -> float:
     return _MUG_BIG_PROB * big + _MUG_SMALL_PROB * small
 
 
-def airport_bust_loss(units, unit_value, cash=0) -> float:
-    """Expected loss when carried drugs are DETECTED at the airport.
+def airport_bust_loss(units, unit_value, cash=0, policy="surrender") -> float:
+    """Capital loss when carried drugs are DETECTED at the airport, under a
+    chosen response ``policy``.
 
-    In ~every resolution the carried drugs are lost:
-      * accepted surrender to airport security  -> drugs gone, cash kept;
-      * flee-escape (airport special case)       -> drugs gone, cash capped $50.
-    So the dominant term is the full inventory value ``units * unit_value``. On
-    top of that sits a small pocket-cash tail: only the flee-escape branch also
-    strips pocket cash down to $50, and that branch is a minority of resolutions
-    (most are an accepted surrender, which keeps cash). We approximate that tail
-    as ``_AIRPORT_FLEE_ESCAPE_FRAC * max(0, cash - 50)``.
+    Detection does NOT auto-resolve: it opens combat vs. airport security and the
+    player picks an action. The clean capital-loss terminal for each sensible
+    policy (decoded from the executable) is:
 
-    APPROXIMATION: treats the carried load as fully lost on a bust (true in the
-    surrender and flee-escape branches; a rejected surrender/failed flee leads
-    back into combat, which is out of scope here). Suitable as the
-    ``bust_cost_hook`` for ``risk.channel_recommendation``. With the default
-    cash=0 the result is exactly the inventory value."""
+      * ``"surrender"`` (default, recommended): the accepted-surrender branch
+        clears all carried drugs and leaves cash & bank untouched, so the
+        capital loss is the full inventory value ``units * unit_value``. Surrender
+        is accepted with prob :data:`SURRENDER_ACCEPT_LAW` per attempt; on
+        rejection you take an attack and can re-surrender, so across the
+        encounter you lose the drugs with near-certainty while keeping all cash.
+        Cash is irrelevant to this branch -- the ``cash`` arg is unused here.
+
+      * ``"run"``: a *successful* Run also clears the drugs but additionally caps
+        pocket cash at :data:`AIRPORT_RUN_CASH_CAP` ($50), so its terminal loss
+        is ``units*unit_value + max(cash - 50, 0)``. (A single Run only escapes
+        with prob :data:`AIRPORT_RUN_ESCAPE_PROB` ≈ 0.10; this returns the loss
+        GIVEN the escape happens, not weighted by that probability.)
+
+    NOT modeled here (out of scope -- see docs/tasks/combat.md): the mortality /
+    health cost of the rejected-surrender / failed-run branches, which feed back
+    into combat and can end in death = game over. The optimizer must weigh that
+    separately; this function returns only the clean capital loss of the
+    terminal drug/cash write.
+
+    Suitable as the ``bust_cost_hook`` for ``risk.channel_recommendation`` via
+    :func:`bust_cost_hook_for_risk` (which uses the default surrender policy).
+    With the default surrender policy the result is exactly the inventory
+    value, independent of ``cash``."""
     inventory_loss = units * unit_value
-    cash_tail = _AIRPORT_FLEE_ESCAPE_FRAC * max(0, cash - _AIRPORT_FLEE_CASH_CAP)
-    return inventory_loss + cash_tail
+    if policy == "surrender":
+        return inventory_loss
+    if policy == "run":
+        return inventory_loss + max(0, cash - AIRPORT_RUN_CASH_CAP)
+    raise ValueError(f"unknown airport policy: {policy!r} (use 'surrender' or 'run')")
 
 
 def daily_carry_risk_cost(inventory_value: float, day: int,
