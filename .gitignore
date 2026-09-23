@@ -5,3 +5,8 @@ __pycache__/
 venv/
 *.tmp
 .DS_Store
+
+# runtime data (per-machine, drifts every play session — not source)
+audit_log.jsonl
+ship_rates.json
+decay_model.json
