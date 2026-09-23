@@ -185,16 +185,14 @@ def test_horizon_none_defaults_to_days_left():
 
 
 # ---------------------------------------------------------------------------
-# Integration: a real simulator rollout to score a plan (needs p08).
+# Integration: a real simulator rollout to score a plan (p08).
 # ---------------------------------------------------------------------------
-@pytest.mark.xfail(reason="needs p08", strict=False)
 def test_plan_scored_against_real_simulator_rollout():
     from dl2model.simulator import Game
 
     game = Game(7)
     # Build a state snapshot from the live game world, plan against it, and
-    # confirm the plan's projected score is a sane integer. Requires the p08
-    # Game API (currently raises NotImplementedError).
+    # confirm the plan's projected score is a sane integer.
     world = game.world
     state = {
         "current_city": "Vancouver",
