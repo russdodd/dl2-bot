@@ -26,6 +26,12 @@ import parse as parser
 import optimizer
 import audit                            # append-only decision/outcome trail
 import shiprates                        # persistent origin->dest courier-rate store
+import decay                            # exact-model spike-decay EV helpers
+from dl2model import shipping as _shipping   # exact shipping cost + failure EV
+from dl2model import stock as _stock         # remote-stock estimate
+from dl2model import finance as _finance     # rank -> capacity
+from dl2model import risk as _risk           # carry-vs-ship channel advisory
+from dl2model import constants as _C
 try:
     import digits                       # exact fixed-font digit reader (needs numpy)
 except Exception:                       # pragma: no cover - degrade to Vision text
@@ -787,6 +793,32 @@ def decide_main():
     # you asked to be left on the main window, not have the world window popped back
     # up at the end.)
 
+    # Exact-model cross-check + fill (dl2model.shipping via shiprates). The measured
+    # rate stays authoritative: we (b) FLAG any measured rate that disagrees with the
+    # model (logged, never overridden) and (a) FILL a destination we still couldn't
+    # measure with the model rate, clearly labelled an estimate.
+    model_checks = []
+    for full_c, r in list(rates.items()):
+        disc = shiprates.rate_discrepancy(current, full_c.split(",")[0], r)
+        if disc:
+            model_checks.append(disc)
+    if model_checks:
+        print(f"  ⚠ {len(model_checks)} measured rate(s) differ from the exact model "
+              f"(measured kept; logged):", file=sys.stderr)
+        for c in model_checks:
+            print(f"      {c['dest']:14s} measured ${c['measured']:,.2f}/u vs "
+                  f"model ${c['model']:,.2f}/u (Δ${c['delta']:,.2f})", file=sys.stderr)
+        audit.record("rate_check", origin=current, day=day, source="model",
+                     changes=model_checks)
+    still_missing = [c for c in dest_short
+                     if full_of.get(c, c) not in rates and c not in rates]
+    filled = shiprates.fill_missing_from_model(current, still_missing)
+    if filled:
+        print(f"  ℹ {len(filled)} rate(s) FILLED from the exact model (estimate, "
+              f"not measured): {', '.join(sorted(filled))}", file=sys.stderr)
+        for cs, r in filled.items():
+            rates.setdefault(full_of.get(cs, cs), r)
+
     # HARD RULE: never drop a price, never hide uncertainty. We keep EVERY read and
     # loudly surface (a) prices the digit reader could not verify and (b) cities
     # whose drug list came back short (a price row that failed to parse would
@@ -869,7 +901,12 @@ def decide_main():
     if not cap:
         print("  ⚠ couldn't read inventory size — free-carry cap unknown, assuming "
               f"{carry:,}. Overflow-shipping estimate may be off.", file=sys.stderr)
-    dests = combined_destinations(current, matrix, market, inv, rates, cash=cash, carry=carry)
+    # Rumor OCR (reading "X will be scarce in <city>" off-screen) is a SEPARATE
+    # later task; until it lands there are no rumors here, so pass None -> ordinary
+    # decay. combined_destinations already conditions on any rumor it IS given.
+    state_rumors = None
+    dests = combined_destinations(current, matrix, market, inv, rates, cash=cash,
+                                  carry=carry, rumors=state_rumors, ship=False)
     print("\n(2) BEST DESTINATION — fly there, sell inventory + Boston buys (POTENTIAL,")
     print("    if spikes hold & that Market trades your drugs on arrival). Each plan")
     print("    trades a BASKET — every inventory drug sellable there + every Boston")
@@ -881,8 +918,11 @@ def decide_main():
               f"quantities shown are what you can afford, best profit-per-$ first.")
     print(f"    up to {carry:,} units fly FREE on the plane (no shipping); overflow ships "
           f"at the per-unit rate. 'ship' column below = units over the free carry.")
-    print(f"      {'city':13} {'COMBINED net':>15} {'inv-sell':>12} {'buy-arb':>12} "
-          f"{'#drugs':>6} {'carry/ship':>12}  top driver")
+    print("    EV(exact-model) = the SAME plan with destination spikes decayed to "
+          "what you'll realize;")
+    print("    the headline COMBINED keeps the observed prices. EV never replaces it.")
+    print(f"      {'city':13} {'COMBINED net':>15} {'EV net':>15} {'inv-sell':>12} "
+          f"{'buy-arb':>12} {'#drugs':>6} {'carry/ship':>12}  top driver")
     for r in dests[:6]:
         n_inv = sum(1 for d in inv if matrix[r['city']].get(d))
         n_arb = len(r["arb"])
@@ -901,6 +941,7 @@ def decide_main():
             drv = f"buy {qty:,} {d} ${buy:,}->${sell:,}" + (f" SPIKE {sell/med[d]:.0f}x" if spike else "")
         cship = f"{r.get('carried',0):,}/{r.get('shipped',0):,}"
         print(f"      {r['city'].split(',')[0]:13} ${r['combined']:>14,.0f} "
+              f"${r.get('ev_combined', r['combined']):>14,.0f} "
               f"${r['inv_net']:>11,.0f} ${r['arb_net']:>11,.0f} {n_inv+n_arb:>6} "
               f"{cship:>12}  {drv}")
 
@@ -910,8 +951,23 @@ def decide_main():
     #     persist ~3 days and so survive the round trip. Additive — never replaces §2.
     repo = reposition_arbs(current, matrix, med, market, cash=cash, carry=carry,
                            spike_mult=SPIKE, held_units=total)
+    # EXACT-model EV: a 2-hop realizes the sell ~2 travel days out, so decay the
+    # spike sell price over n=2 days (decay.expected_sell_price). This REPLACES
+    # the old fitted-curve EV as the honest valuation; the fitted collector
+    # (`dl2 decay`) stays as a cross-check (printed below when it has enough data).
+    REPO_DAYS = 2
+    def _repo_ev(r):
+        ev_sell = None
+        try:
+            ev_sell = decay.expected_sell_price(r["sell"], r["drug"], r["sell_city"],
+                                                n=REPO_DAYS)
+        except Exception:
+            ev_sell = None
+        if ev_sell is None:
+            return None
+        return r["units"] * (ev_sell - r["buy"])
     dmodel = _load_decay_model()
-    ratio2 = _decay_ratio(dmodel, 2)                 # ~2 travel days for a 2-hop
+    ratio2 = _decay_ratio(dmodel, 2)                 # fitted cross-check (or None)
     print("\n" + "=" * 66)
     print("(3) TWO-TURN PLAYS (higher variance) — fly to a BUY city, then to the")
     print("    SPIKE city. Surfaces plays the 1-hop view CAN'T: cheap stock that's a")
@@ -920,24 +976,22 @@ def decide_main():
     print("      see that city's Market or stock until we land, so each row is a BET")
     print("      it sells the drug near this price. Gated to true spikes (sell ≥")
     print(f"      {SPIKE:.0f}× median), which last ~3 days and so outlive the 2-day trip.")
+    print(f"    EV(~2d) = the exact market model decaying the spike over ~{REPO_DAYS} "
+          f"days (~$16k/day),")
+    print("      shown ALONGSIDE the un-decayed headline profit — never replacing it.")
     if ratio2 is not None:
-        print(f"    EV(~2d) = headline × decay for ~2 days (model e^(-{dmodel['k']}·days),"
-              f" half-life {dmodel.get('half_life_days')}d) — shown ALONGSIDE the headline.")
-    else:
-        print("    Decay is UNMODELLED (not enough pairs yet — run `dl2 decay`): the")
-        print("    headline is the UN-decayed spike; the real ~2-day-old price is lower.")
+        print(f"      (fitted cross-check available: e^(-{dmodel['k']}·days), "
+              f"half-life {dmodel.get('half_life_days')}d.)")
     if not repo:
         print("    — no two-turn spike plays right now (no gated spike has cheaper")
         print("      buyable stock in another city, or free plane-carry is full).")
     else:
         hdr = (f"      {'buy in':13} {'drug':9} {'buy@world':>10}    {'sell in':13} "
-               f"{'spike':>9} {'mult':>5} {'units':>6} {'profit':>13}")
-        print(hdr + ("     EV(~2d)" if ratio2 is not None else ""))
+               f"{'spike':>9} {'mult':>5} {'units':>6} {'profit':>13}     EV(~2d)")
+        print(hdr)
         for r in repo[:6]:
-            ev = ""
-            if ratio2 is not None:
-                ev_profit = r["units"] * (r["sell"] * ratio2 - r["buy"])
-                ev = f"  ${ev_profit:>11,.0f}"
+            ev_profit = _repo_ev(r)
+            ev = f"  ${ev_profit:>11,.0f}" if ev_profit is not None else ""
             print(f"      {r['buy_city'].split(',')[0]:13} {r['drug']:9} "
                   f"${r['buy']:>9,} -> {r['sell_city'].split(',')[0]:13} "
                   f"${r['sell']:>8,} {r['mult']:>4.0f}x {r['units']:>6,} "
@@ -948,15 +1002,51 @@ def decide_main():
                 f"${t['buy']:,}: buy {t['units']:,}, fly to "
                 f"{t['sell_city'].split(',')[0]}, sell ${t['sell']:,} "
                 f"≈ ${t['profit']:,.0f}")
-        if ratio2 is not None:
-            line += (f"  (EV ≈ ${t['units']*(t['sell']*ratio2-t['buy']):,.0f} "
-                     f"after ~2-day decay)")
+        _tev = _repo_ev(t)
+        if _tev is not None:
+            line += f"  (EV ≈ ${_tev:,.0f} after ~{REPO_DAYS}-day decay)"
         print(line)
         if t["alts"]:
             alt = ", ".join(f"{c.split(',')[0]} ${p:,}" for c, p in t["alts"])
             print(f"      (other buy cities for {t['drug']}: {alt} — cheapest wins)")
         print("      Carry-bounded: units = your free plane slots (inventory size −")
         print("      held). Sell/drop held stock, or level up, to carry more.")
+
+    # (4) CHANNEL + SHIPPER ADVISORY (advisory only — never changes the default
+    #     ship action of International Couriers overnight). For the top destination's
+    #     biggest bought load: (a) is a cheaper/safer shipper higher-EV? (folding in
+    #     the all-or-nothing delivery probability) and (b) carry vs ship, reporting
+    #     the No-Scent detection probability (combat-loss magnitude is UNKNOWN in the
+    #     model, so it is reported, never invented). Degrades silently if absent.
+    no_scent = main_st.get("no_scent") or status.get("no_scent")
+    if dests and dests[0].get("arb"):
+        b = dests[0]
+        d0, units0, buy0, sell0, _p0 = b["arb"][0]
+        dshort = b["city"].split(",")[0]
+        adv = ship_advisory(current, dshort, units0, sell0)
+        chan = channel_advice(units0, sell0, no_scent, current, dshort)
+        if adv or chan:
+            print("\n" + "=" * 66)
+            print(f"(4) CHANNEL ADVISORY for {units0:,} {d0} -> {dshort} (advisory only):")
+        if adv:
+            dfl = adv["default"]
+            if dfl:
+                print(f"    default {dfl[0]} (p={dfl[1]:.2f}): "
+                      f"EV ${dfl[2]:,.0f}")
+            if adv["better"]:
+                bt = adv["better"]
+                print(f"    ⓘ higher-EV shipper available: {bt[0]} (p={bt[1]:.2f}) "
+                      f"EV ${bt[2]:,.0f} — advisory, default unchanged.")
+            else:
+                print(f"    default shipper is already the highest-EV choice here.")
+        if chan and chan.get("carry"):
+            c = chan["carry"]
+            sev = chan.get("ship", {}).get("expected_value")
+            print(f"    carry: {c['cans_used']}/{c['cans_needed']} No-Scent cans, "
+                  f"detection prob {c['detection_prob']:.2%} "
+                  f"(bust loss UNKNOWN — combat resolution undecoded).")
+            if sev is not None:
+                print(f"    ship:  EV ${sev:,.0f} (delivery-failure priced in).")
 
     # ---------- honest bottom line ----------
     print("\n" + "-" * 66)
@@ -1282,6 +1372,77 @@ def _arb_ok(buy, sell, rate, safety=None):
     return sell * (1 - s) - buy - rate > 0
 
 
+# The shipper/speed the bot actually uses when it ships (see README `dl2 ship`).
+# Everything below prices a plan with THIS default and only SURFACES a cheaper
+# alternative as an advisory — it never changes the default ship action.
+DEFAULT_SHIPPER = "International Couriers"      # 0.99 delivery
+DEFAULT_SHIP_DAYS = 1                            # overnight
+
+
+def shipper_ev_ranking(origin, dest, units, unit_value, days=DEFAULT_SHIP_DAYS):
+    """EV of shipping `units` each worth `unit_value` at the destination, per
+    shipper, via the EXACT model (shipping.expected_ship_value folds in the
+    all-or-nothing delivery probability and the sunk fee). Returns
+    [(shipper, success_prob, ev)] best-EV first. `origin`/`dest` are SHORT city
+    names (must be in constants.CITY_POS). Advisory only — the default ship
+    action stays DEFAULT_SHIPPER/DEFAULT_SHIP_DAYS regardless of this ranking."""
+    out = []
+    for shipper in _C.SHIPPERS:
+        try:
+            ev = _shipping.expected_ship_value(origin, dest, units, unit_value,
+                                               shipper, days)
+        except Exception:
+            continue
+        out.append((shipper, _shipping.success_prob(shipper), ev))
+    out.sort(key=lambda t: -t[2])
+    return out
+
+
+def ship_advisory(origin, dest, units, unit_value, days=DEFAULT_SHIP_DAYS):
+    """Compare the DEFAULT shipper's EV to the best-EV shipper. Returns
+    {default, best, better} where `better` is a cheaper/safer shipper that beats
+    the default (or None if the default is already best). Advisory — surface it,
+    do NOT change the default ship action."""
+    ranking = shipper_ev_ranking(origin, dest, units, unit_value, days)
+    if not ranking:
+        return None
+    default = next((r for r in ranking if r[0] == DEFAULT_SHIPPER), None)
+    best = ranking[0]
+    better = best if (default is None or best[0] != DEFAULT_SHIPPER) and \
+        (default is None or best[2] > default[2]) else None
+    return {"default": default, "best": best, "better": better, "ranking": ranking}
+
+
+def estimate_remote_stock(observed_price, drug, city, rank):
+    """ESTIMATE of the buyable stock at a REMOTE destination you can't see yet:
+    stock.stock_target(observed_price, M, C) with C = capacity_for_rank(rank) and
+    M = normal_mean. Labelled an estimate everywhere it's used — you only KNOW a
+    market once you arrive. Returns None on unknown drug/city/rank."""
+    try:
+        if not decay.in_model(drug, city):
+            return None
+        M = _C.normal_mean(drug, city.split(",")[0])
+        cap = _finance.capacity_for_rank(rank)
+        return max(_stock.stock_target(observed_price, M, cap), 0)
+    except Exception:
+        return None
+
+
+def channel_advice(units, unit_value, no_scent, origin, dest,
+                   shipper=DEFAULT_SHIPPER, days=DEFAULT_SHIP_DAYS):
+    """Carry-vs-ship advisory for the chosen load (risk.channel_recommendation).
+    Combat-loss magnitude is UNKNOWN in the model, so bust_cost_hook stays None
+    and the carry side reports the No-Scent detection probability only. Advisory
+    only — never changes the default ship action. Returns None on unknown city."""
+    try:
+        return _risk.channel_recommendation(
+            units=units, unit_value=unit_value, cans_available=(no_scent or 0),
+            origin=origin, dest=dest, shipper=shipper, days=days,
+            bust_cost_hook=None)
+    except Exception:
+        return None
+
+
 def _arb_legs(buy_market, sell_prices, rate, safety, cash, free):
     """The buy-here/sell-there greedy, factored out of combined_destinations so the
     2-hop reposition search reuses the EXACT same economics (safety filter, cash
@@ -1335,7 +1496,7 @@ def _arb_legs(buy_market, sell_prices, rate, safety, cash, free):
 
 
 def combined_destinations(current, matrix, market, inv, ship_rates, safety=None,
-                          cash=None, carry=0):
+                          cash=None, carry=0, rumors=None, ship=False, ship_days=1):
     """Rank each destination by the COMBINED value of flying there and selling
     EVERYTHING you can there in one turn: your existing inventory PLUS goods you
     buy in the current Market and bring along. You fly to one city, so the two
@@ -1362,8 +1523,17 @@ def combined_destinations(current, matrix, market, inv, ship_rates, safety=None,
     _arb_ok) — stricter for shipped units (they also eat `rate`). Reported profit
     uses the headline sell price; the safety margin is a filter, not a haircut.
     Every number is POTENTIAL: it needs the spike to hold and the destination's
-    Market to actually trade the drug on arrival (unknowable until you land)."""
+    Market to actually trade the drug on arrival (unknowable until you land).
+
+    EXACT-MODEL EV (additive, dl2model wiring): alongside the headline `combined`,
+    each row also carries `ev_net`/`ev_combined` and `arb_ev` — the SAME plan
+    valued with decay.expected_sell_price, i.e. the destination sell prices
+    decayed to what you'll realize `n` days out (n=1 flown, else the shipment's
+    expected transit), and conditioned on any (drug, city) rumor. The headline
+    ranking is UNCHANGED; EV is an added column, never a replacement (owner rule).
+    Sells you'll realize at the destination are the only ones decayed."""
     s = ARB_SAFETY if safety is None else safety
+    n_days = decay.sell_horizon_days(ship=ship, ship_days=ship_days)
     inv_total = sum(inv.values())
     out = []
     for city, cp in matrix.items():
@@ -1380,8 +1550,36 @@ def combined_destinations(current, matrix, market, inv, ship_rates, safety=None,
         # buy-here/sell-there arb for this city — the shared greedy (see _arb_legs)
         arb, cc, cs = _arb_legs(market, cp, rate, s, cash, free)
         arb_net = sum(a[4] for a in arb)
+
+        # --- exact-model EV of the same rows (headline sell -> decayed EV sell) ---
+        def _ev(observed, drug):
+            try:
+                return decay.expected_sell_price(
+                    observed, drug, city, n=n_days,
+                    rumor=decay.find_rumor(rumors, drug, city))
+            except Exception:
+                return None
+        arb_ev = []
+        arb_ev_net = 0.0
+        for d, units, buy, sell, profit in arb:
+            ev_sell = _ev(sell, d)
+            if ev_sell is None:
+                ev_sell, ev_profit = sell, profit          # fall back to observed
+            else:
+                # profit = units*(sell-buy) - shipped*rate; swapping sell->ev_sell
+                # shifts every unit by the per-unit haircut, shipping cost intact.
+                ev_profit = profit - units * (sell - ev_sell)
+            arb_ev.append((d, units, buy, ev_sell, ev_profit))
+            arb_ev_net += ev_profit
+        # inventory carried to the destination is also realized n days out
+        inv_ev_rev = sum(inv.get(d, 0) * ((_ev(cp[d], d) if cp.get(d) else None) or (cp.get(d) or 0))
+                         for d in inv)
+        inv_ev_net = inv_ev_rev - rate * (inv_total - inv_carried)
+
         out.append({"city": city, "combined": inv_net + arb_net, "inv_net": inv_net,
                     "arb_net": arb_net, "arb": arb, "rate": rate,
+                    "ev_net": arb_ev_net, "inv_ev_net": inv_ev_net,
+                    "ev_combined": inv_ev_net + arb_ev_net, "arb_ev": arb_ev,
                     "carried": inv_carried + cc,
                     "shipped": (inv_total - inv_carried) + cs})
     out.sort(key=lambda r: -r["combined"])
@@ -1470,13 +1668,19 @@ def reposition_arbs(current, matrix, med, own_market, safety=None, cash=None,
     return rows
 
 
-def best_net_plan(market, matrix, ship_rates, safety=None):
+def best_net_plan(market, matrix, ship_rates, safety=None, origin=None):
     """For each destination with a measured rate, keep only drugs whose spread beats
     the flat per-unit shipping cost AND survives an ARB_SAFETY sell-price drop (so a
     razor-thin trade the overnight reroll would flip negative is excluded). Returns
-    every city's net plan, ranked by net."""
+    every city's net plan, ranked by net (headline, unchanged).
+
+    When `origin` (short city name) is given, each plan also carries `ship_ev` —
+    the SAME trades valued with shipping.expected_ship_value (the default shipper's
+    all-or-nothing delivery probability priced in), added ALONGSIDE the headline
+    `total`. Unknown cities just omit it. The default ship action never changes."""
     plans = []
     for city, rate in ship_rates.items():
+        short = city.split(",")[0]
         trades = []
         for drug, info in market.items():
             buy, qty = info.get("price"), info.get("qty") or 0
@@ -1486,8 +1690,21 @@ def best_net_plan(market, matrix, ship_rates, safety=None):
             net_u = sell - buy - rate
             if net_u > 0 and qty > 0 and _arb_ok(buy, sell, rate, safety):
                 trades.append((drug, buy, sell, net_u, qty, net_u * qty))
-        plans.append({"city": city, "rate": rate, "total": sum(t[5] for t in trades),
-                      "trades": sorted(trades, key=lambda t: -t[5])})
+        plan = {"city": city, "rate": rate, "total": sum(t[5] for t in trades),
+                "trades": sorted(trades, key=lambda t: -t[5])}
+        if origin:
+            # EV with delivery-failure priced in: EV of proceeds - buy outlay,
+            # per drug, summed. unit_value is the (observed) destination sell.
+            ship_ev = 0.0
+            for d, buy, sell, net_u, qty, tot in trades:
+                try:
+                    ev = _shipping.expected_ship_value(
+                        origin, short, qty, sell, DEFAULT_SHIPPER, DEFAULT_SHIP_DAYS)
+                    ship_ev += ev - qty * buy
+                except Exception:
+                    ship_ev += tot          # fall back to headline net for this leg
+            plan["ship_ev"] = ship_ev
+        plans.append(plan)
     plans.sort(key=lambda p: -p["total"])
     return plans
 

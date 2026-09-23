@@ -32,6 +32,8 @@ import json
 import sys
 from dataclasses import dataclass, field
 
+import decay                                   # exact-model spike-decay EV helpers
+
 
 @dataclass
 class Load:
@@ -39,10 +41,22 @@ class Load:
     qty: int
     unit_cost: int
     unit_sell: int
+    # Exact-model EV of the sell price by the time you realize it (added ALONGSIDE
+    # the observed unit_sell, never replacing it). None when the drug/city isn't
+    # in the model tables — the observed price then stands alone.
+    unit_sell_ev: float = None
 
     @property
     def profit(self) -> int:
+        """Headline profit at the OBSERVED sell price (unchanged)."""
         return (self.unit_sell - self.unit_cost) * self.qty
+
+    @property
+    def ev_profit(self) -> float:
+        """Profit valued at the exact-model EV sell price (falls back to the
+        observed price when no EV is available)."""
+        sell = self.unit_sell if self.unit_sell_ev is None else self.unit_sell_ev
+        return (sell - self.unit_cost) * self.qty
 
 
 @dataclass
@@ -50,8 +64,12 @@ class Plan:
     destination: str
     sell_now: list = field(default_factory=list)   # (drug, qty, unit_price, realized)
     buys: list = field(default_factory=list)        # Load objects (buy here, sell at dest)
-    sell_held_at_dest: list = field(default_factory=list)  # (drug, qty, unit_price)
+    sell_held_at_dest: list = field(default_factory=list)  # (drug, qty, unit_price[, ev])
     projected_cash: int = 0
+    # Projected cash valuing every price realized at the destination (buys + carried
+    # inventory) with the exact-model EV instead of the raw observed price. An added
+    # figure ALONGSIDE projected_cash (the headline), never a replacement.
+    ev_cash: float = 0
     note: str = ""
 
 
@@ -122,6 +140,25 @@ def optimize(state: dict) -> list:
         buy_stock = state.get("stock", {})
     here_sell = prices.get(city, {})          # sell prices in the current city
 
+    # Exact-model EV wiring (additive; see decay.expected_sell_price). Anything
+    # you sell at the DESTINATION is realized `n` days out, so value it with the
+    # exact spike-decay model. `n` = 1 for a flown/carried trade, else the
+    # shipment's expected transit. Rumors (if state carries them) condition the
+    # next-day price. All optional/tolerated-when-absent for back-compat.
+    rumor_list = state.get("rumors") or []
+    ship = bool(state.get("ship"))
+    n_days = decay.sell_horizon_days(ship=ship, ship_days=int(state.get("ship_days", 1)))
+
+    def _ev(observed, drug, dest):
+        """EV sell price for `drug` realized at `dest`, or None (unknown drug/city
+        or model error) — the caller then keeps the observed price."""
+        try:
+            return decay.expected_sell_price(
+                observed, drug, dest, n=n_days,
+                rumor=decay.find_rumor(rumor_list, drug, dest))
+        except Exception:
+            return None
+
     plans = []
     for dest, dest_prices in prices.items():
         p = Plan(destination=dest)
@@ -138,26 +175,39 @@ def optimize(state: dict) -> list:
             if best_here <= 0 and best_there <= 0:
                 continue
             if best_here >= best_there:
+                # Sold NOW, in the current city — realized today, no decay.
                 p.sell_now.append((drug, qty, here, here * qty))
                 working_cash += here * qty
             else:
-                p.sell_held_at_dest.append((drug, qty, there))
+                # Carried & sold at the destination -> value with EV alongside.
+                ev = _ev(there, drug, dest)
+                p.sell_held_at_dest.append((drug, qty, there, ev))
 
         # 2) Buy here, sell at dest (arbitrage). Uses cash freed by selling-now.
         loads = _fill_load(buy_prices, dest_prices, working_cash, capacity, buy_stock)
+        for l in loads:
+            l.unit_sell_ev = _ev(l.unit_sell, l.drug, dest)
         p.buys = loads
 
         realized = sum(r[3] for r in p.sell_now)
         arb_profit = sum(l.profit for l in loads)
-        held_dest = sum(q * price for (_, q, price) in p.sell_held_at_dest)
+        held_dest = sum(q * price for (_, q, price, *_e) in p.sell_held_at_dest)
+        held_dest_ev = sum(q * (h[0] if h and h[0] is not None else price)
+                           for (_, q, price, *h) in p.sell_held_at_dest)
         # projected cash after: sell-now proceeds already in working_cash; then we
         # spend on buys and (at dest) receive buy-sells + held-at-dest proceeds.
         spend = sum(l.qty * l.unit_cost for l in loads)
         p.projected_cash = working_cash - spend + \
             sum(l.qty * l.unit_sell for l in loads) + held_dest
+        # EV valuation of the same move (destination sells decayed to their EV).
+        p.ev_cash = working_cash - spend + \
+            sum(l.qty * (l.unit_sell_ev if l.unit_sell_ev is not None else l.unit_sell)
+                for l in loads) + held_dest_ev
         p.note = f"arb +{arb_profit:,} | sell-now {realized:,} | carry&sell {held_dest:,}"
         plans.append(p)
 
+    # Rank by the OBSERVED-price projection (headline, unchanged). ev_cash rides
+    # alongside as the honest valuation — never replaces the headline ranking.
     plans.sort(key=lambda pl: pl.projected_cash, reverse=True)
     return plans
 
@@ -193,18 +243,28 @@ def format_plan(state, plans, top=3, unlimited=False):
     if best.buys:
         out.append(f"  Buy now (in {city}):")
         for l in best.buys:
+            ev = "" if l.unit_sell_ev is None else \
+                f" [EV ${l.unit_sell_ev:,.0f}/u after decay]"
             out.append(f"    - Buy {l.qty} {l.drug} @ ${l.unit_cost:,} "
-                       f"(sell in {best.destination} @ ${l.unit_sell:,}, +${l.profit:,})")
+                       f"(sell in {best.destination} @ ${l.unit_sell:,}, +${l.profit:,}){ev}")
     if best.sell_held_at_dest:
         out.append(f"  Carry & sell in {best.destination}:")
-        for drug, qty, price in best.sell_held_at_dest:
-            out.append(f"    - {qty} {drug} @ ${price:,}")
+        for drug, qty, price, *rest in best.sell_held_at_dest:
+            ev = rest[0] if rest else None
+            evs = "" if ev is None else f" [EV ${ev:,.0f}/u]"
+            out.append(f"    - {qty} {drug} @ ${price:,}{evs}")
     gain = best.projected_cash - cash
     if unlimited:
         out.append(f"  Profit from this move: +${gain:,}")
     else:
         out.append(f"  Projected cash after the move: ${best.projected_cash:,}  "
                    f"({'+' if gain >= 0 else ''}{gain:,})")
+    # Honest EV alongside the headline (spike prices decay before you can sell).
+    if best.ev_cash and abs(best.ev_cash - best.projected_cash) >= 1:
+        ev_gain = best.ev_cash - cash
+        out.append(f"  Exact-model EV after the move: ${best.ev_cash:,.0f}  "
+                   f"({'+' if ev_gain >= 0 else ''}{ev_gain:,.0f}) "
+                   f"— decays destination spikes to what you'll realize.")
     if stay and best.destination != city:
         edge = best.projected_cash - stay.projected_cash
         out.append(f"  (Beats staying put by ${edge:,}.)")

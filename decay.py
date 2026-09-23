@@ -27,10 +27,117 @@ import sys
 import time
 
 import audit
+from dl2model import prices, shipping, rumors
+from dl2model.constants import normal_mean
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.environ.get("DL2_DECAY_MODEL", os.path.join(HERE, "decay_model.json"))
 MIN_PAIRS = 10                       # clean pairs (known day gap) needed to fit
+
+
+# --------------------------------------------------------------------------- #
+# Exact-model spike-decay EV (the dl2model wiring).
+#
+# The `dl2 decay` collector above FITS a percentage curve from realized trades;
+# it stays, now as a cross-check. The valuation the live bot actually uses is the
+# decompiled market's exact rule: a price drifts toward its hidden target by
+# rand()%gap each ordinary day, and rand() maxes at 32767, so a big spike sheds
+# at most $32,767/day (expected $16,383.50) — LINEAR in dollars, not exponential
+# in percent. The old fit under-valued spikes; this does not. These helpers value
+# a price you'll REALIZE `n` days from now with that exact model.
+#
+# HARD RULE (owner): the EV is an honest column ALONGSIDE, never replacing, the
+# observed headline price. Callers keep the raw observed price and ADD the EV;
+# when a drug/city isn't in the model tables (e.g. an OCR misspelling like
+# "Ecstasy"), expected_sell_price returns None and the caller falls back to the
+# observed price — nothing is ever dropped.
+# --------------------------------------------------------------------------- #
+
+def in_model(drug, city) -> bool:
+    """True iff (drug, city) are both known to the exact model (so normal_mean
+    won't KeyError). Lets callers add an EV only where it's meaningful."""
+    from dl2model import constants as C
+    return drug in C.BASE_PRICE and city.split(",")[0] in C.CITY_MULT
+
+
+def market_target(drug, city, target=None):
+    """The hidden target a price decays toward. The true target isn't visible in
+    one OCR read, so default to M = normal_mean(drug, city) — the market's normal
+    level. Pass `target` once a better estimate exists (future work: infer it
+    from successive audit-log readings of the same city/drug)."""
+    return normal_mean(drug, city.split(",")[0]) if target is None else target
+
+
+def ev_after_days(observed_price, target, n):
+    """prices.expected_price_after_days generalized to a fractional `n`. The exact
+    model iterates WHOLE days; for a fractional horizon (a shipment's expected
+    transit, e.g. 1.25 days) we linearly interpolate between the whole-day
+    results. n<=0 -> the observed price unchanged (a sale realized today)."""
+    if n <= 0:
+        return float(observed_price)
+    lo = int(n)
+    ev_lo = prices.expected_price_after_days(observed_price, target, lo)
+    frac = n - lo
+    if frac <= 0:
+        return ev_lo
+    ev_hi = prices.expected_price_after_days(observed_price, target, lo + 1)
+    return ev_lo + frac * (ev_hi - ev_lo)
+
+
+def sell_horizon_days(ship=False, ship_days=1):
+    """Days until you realize a sell: 1 for a flown (carried) trade; else the
+    shipment's EXPECTED transit (shipping.expected_transit_days, incl. slip)."""
+    if not ship:
+        return 1
+    return shipping.expected_transit_days(ship_days)
+
+
+def _rumor_direction(rumor):
+    """Pull a 'scarce'/'abundant' direction out of a rumor mapping/object, else
+    None (absent/unrecognised rumor -> ordinary decay)."""
+    if not rumor:
+        return None
+    d = rumor.get("direction") if isinstance(rumor, dict) \
+        else getattr(rumor, "direction", None)
+    return d if d in ("scarce", "abundant") else None
+
+
+def find_rumor(rumor_list, drug, city):
+    """The state rumor matching (drug, city) from a `state['rumors']` list, or
+    None. Tolerates short or full city names. Absent list -> None (back-compat)."""
+    if not rumor_list:
+        return None
+    short = (city or "").split(",")[0]
+    for r in rumor_list:
+        rd = r.get("drug") if isinstance(r, dict) else getattr(r, "drug", None)
+        rc = r.get("city") if isinstance(r, dict) else getattr(r, "city", None)
+        if rd == drug and (rc == city or (rc or "").split(",")[0] == short):
+            return r
+    return None
+
+
+def expected_sell_price(observed_price, drug, city, n=1, target=None, rumor=None):
+    """Exact-model EV of the price you'll realize `n` days from now for `drug` at
+    `city`. Returned as a column ALONGSIDE `observed_price`, NEVER in place of it
+    (owner hard rule). Returns None when (drug, city) aren't in the model tables
+    so the caller falls back to the observed price.
+
+    target: hidden market target; defaults to M = normal_mean(drug, city).
+    rumor:  optional {"direction": "scarce"|"abundant"} (dict or object). When
+            present, tomorrow's price is conditioned on the rumor (rumors.py) —
+            the strongest route signal in the game — instead of ordinary decay.
+            A rumor is a NEXT-DAY signal, applied to the immediate valuation
+            regardless of n. Absent/unrecognised -> ordinary decay."""
+    if not in_model(drug, city):
+        return None
+    short = city.split(",")[0]
+    M = normal_mean(drug, short)
+    tgt = M if target is None else target
+    direction = _rumor_direction(rumor)
+    if direction is not None:
+        r = rumors.Rumor(drug=drug, city=short, direction=direction)
+        return rumors.expected_next_price_given_rumor(observed_price, tgt, M, r)
+    return ev_after_days(observed_price, tgt, n)
 
 
 def _short(city):
