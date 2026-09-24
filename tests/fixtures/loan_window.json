@@ -1,0 +1,38 @@
+{
+  "width": 640,
+  "height": 420,
+  "frame": {"x": 200, "y": 40, "w": 640, "h": 420},
+  "_note": "SYNTHETIC loan-shark window OCR — hand-built to the layout parse_loan_window assumes (see its docstring). Replace with a real dl2read capture once the live window is confirmed; adjust the parser if the real layout differs.",
+  "boxes": [
+    {"text": "Loan Sharks", "x": 40, "y": 20, "w": 140, "h": 24, "conf": 1},
+    {"text": "Lender", "x": 40, "y": 70, "w": 80, "h": 18, "conf": 1},
+    {"text": "Rate", "x": 260, "y": 70, "w": 50, "h": 18, "conf": 1},
+    {"text": "Term", "x": 380, "y": 70, "w": 50, "h": 18, "conf": 1},
+
+    {"text": "Odd Lenny", "x": 40, "y": 110, "w": 110, "h": 18, "conf": 1},
+    {"text": "60%", "x": 260, "y": 110, "w": 40, "h": 18, "conf": 1},
+    {"text": "1 day", "x": 380, "y": 110, "w": 50, "h": 18, "conf": 1},
+
+    {"text": "One-eyed Wilbur", "x": 40, "y": 150, "w": 160, "h": 18, "conf": 1},
+    {"text": "50%", "x": 260, "y": 150, "w": 40, "h": 18, "conf": 1},
+    {"text": "3 days", "x": 380, "y": 150, "w": 60, "h": 18, "conf": 1},
+
+    {"text": "Laughing Max", "x": 40, "y": 190, "w": 140, "h": 18, "conf": 1},
+    {"text": "40%", "x": 260, "y": 190, "w": 40, "h": 18, "conf": 1},
+    {"text": "4 days", "x": 380, "y": 190, "w": 60, "h": 18, "conf": 1},
+
+    {"text": "Strange ear Leonard", "x": 40, "y": 230, "w": 200, "h": 18, "conf": 1},
+    {"text": "30%", "x": 260, "y": 230, "w": 40, "h": 18, "conf": 1},
+    {"text": "5 days", "x": 380, "y": 230, "w": 60, "h": 18, "conf": 1},
+
+    {"text": "Buddles", "x": 40, "y": 270, "w": 80, "h": 18, "conf": 1},
+    {"text": "15%", "x": 260, "y": 270, "w": 40, "h": 18, "conf": 1},
+    {"text": "6 days", "x": 380, "y": 270, "w": 60, "h": 18, "conf": 1},
+
+    {"text": "You owe", "x": 40, "y": 340, "w": 70, "h": 18, "conf": 1},
+    {"text": "$1,000", "x": 140, "y": 340, "w": 70, "h": 18, "conf": 1},
+    {"text": "to Buddles", "x": 240, "y": 340, "w": 100, "h": 18, "conf": 1},
+    {"text": "15%/day,", "x": 380, "y": 340, "w": 80, "h": 18, "conf": 1},
+    {"text": "due in 6 days", "x": 490, "y": 340, "w": 110, "h": 18, "conf": 1}
+  ]
+}

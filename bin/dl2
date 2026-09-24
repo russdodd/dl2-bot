@@ -2,6 +2,7 @@
 # dl2 — Drug Lord 2 trade assistant.
 #   dl2 plan       full sweep of every city/drug -> the single best trade (recommended)
 #   dl2 decide     what to do with your inventory (uses the cached shipping-rate store)
+#   dl2 loan       read the loan-shark window; `loan borrow <shark> <amt>` / `loan repay <amt>`
 #   dl2 shiprates  print the persistent origin->dest shipping-rate store + gaps
 #   dl2 decay      projected-vs-realized spike-decay data from the audit log
 #   dl2            quick one-shot reading of the current view
@@ -30,5 +31,6 @@ case "$1" in
   shiprates) exec "$PY" "$DIR/shiprates.py" "${@:2}" ;;
   decay) exec "$PY" "$DIR/decay.py" "${@:2}" ;;
   ship) exec "$PY" "$DIR/dl2sweep.py" ship "${@:2}" ;;
+  loan) exec "$PY" "$DIR/dl2sweep.py" loan "${@:2}" ;;
   *)    exec "$PY" "$DIR/dl2.py" "$@" ;;
 esac
