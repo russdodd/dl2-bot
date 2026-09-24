@@ -29,7 +29,8 @@ import shiprates                        # persistent origin->dest courier-rate s
 import decay                            # exact-model spike-decay EV helpers
 from dl2model import shipping as _shipping   # exact shipping cost + failure EV
 from dl2model import stock as _stock         # remote-stock estimate
-from dl2model import finance as _finance     # rank -> capacity
+from dl2model import finance as _finance     # rank -> capacity, loan math
+from dl2model import strategy as _strategy    # loan-to-promote evaluation
 from dl2model import risk as _risk           # carry-vs-ship channel advisory
 from dl2model import constants as _C
 try:
@@ -50,6 +51,7 @@ SWEEP_DRUGS = ["Cocaine", "Crack", "Ecstacy", "Hashish", "Heroin", "Ice", "Kat",
 
 
 DIGIT_PNG = "/tmp/dl2_digits.png"   # scratch capture used for exact digit reads
+LOAN_STATE_PATH = "/tmp/dl2_loan.json"   # last-read loan-window state (for `dl2 decide`)
 
 
 def _read(cursor=False, save=None, window="World"):
@@ -1048,6 +1050,22 @@ def decide_main():
             if sev is not None:
                 print(f"    ship:  EV ${sev:,.0f} (delivery-failure priced in).")
 
+    # (5) LOAN ADVISORY (compute-only — never borrows). Uses the live Status-box
+    #     debt plus the loan-window state cached by the last `dl2 loan` read (for
+    #     the current loan's rate + due day). value_per_extra_day is the best
+    #     buy-arb net here, a conservative per-trading-day profit proxy.
+    try:
+        loans_cache = json.load(open(LOAN_STATE_PATH))
+    except Exception:
+        loans_cache = None
+    vpd = dests[0]["arb_net"] if dests else 0
+    la = loan_advisory(status, loans_cache, vpd, promotions=status.get("promotions"))
+    if la["lines"]:
+        print("\n" + "=" * 66)
+        print("(5) LOAN ADVISORY (advisory only — never auto-borrows):")
+        for ln in la["lines"]:
+            print("    " + ln)
+
     # ---------- honest bottom line ----------
     print("\n" + "-" * 66)
     if sell_now_total > 0:
@@ -1441,6 +1459,88 @@ def channel_advice(units, unit_value, no_scent, origin, dest,
             bust_cost_hook=None)
     except Exception:
         return None
+
+
+def loan_advisory(status, loans, value_per_extra_day, promotions=None):
+    """PURE loan advice (no screen, no game). Two independent parts:
+
+      (a) repay-by-day — project the outstanding debt forward to its due day with
+          finance.debt_after_days, report what it costs to clear now
+          (finance.early_payment_total), and warn when it must be repaid (a loan
+          left past the game's end is a straight subtraction from final_score =
+          cash + bank − debt);
+      (b) loan-to-promote — strategy.evaluate_loan_to_promote: does borrowing to
+          vault the NEXT rank threshold pay for the interest it accrues? Advisory
+          only — this NEVER borrows.
+
+    `status`  live Status box dict: cash/bank/debt/rank/day/total_days.
+    `loans`   the last-read loan-window state (parse_loan_window: a `loans` list of
+              per-shark {owed,rate,due,days_left} + `total_debt`) or None. You can
+              owe several sharks at once, so the debt is a PORTFOLIO; the live
+              Status `debt` is the authoritative total when the book is unread.
+    `value_per_extra_day`  the planner's per-day profit estimate (loan-to-promote
+              input, kept a parameter so this stays pure/testable).
+    `promotions`  ranks already earned (no repeat bonus days); default none.
+
+    Returns {"lines": [str, ...], "repay": {...}|None, "promote": {...}}.
+    """
+    cash = int(status.get("cash") or 0)
+    bank = int(status.get("bank") or 0)
+    debt = int(status.get("debt") or 0)
+    day, total_days = status.get("day"), status.get("total_days")
+    loans = loans or {}
+    lines, repay = [], None
+    game_days_left = ((total_days - day) if day is not None and total_days is not None
+                      else None)
+
+    # ---- (a) repay-by-day (portfolio of per-shark loans) -----------------
+    book = [L for L in (loans.get("loans") or []) if (L.get("owed") or 0) > 0]
+    total = loans.get("total_debt")
+    if total is None:
+        total = sum(L["owed"] for L in book) if book else debt
+    if (total or 0) > 0 or book:
+        repay = {"total_debt": total, "game_days_left": game_days_left,
+                 "next_day_interest": None, "clear_now": None, "loans": book}
+        priced = [L for L in book if L.get("rate") is not None and L.get("owed") is not None]
+        if priced:
+            next_day = sum(L["owed"] * L["rate"] // 100 for L in priced)
+            clear_now = sum(_finance.early_payment_total(L["owed"], L["rate"]) for L in priced)
+            repay["next_day_interest"] = next_day
+            repay["clear_now"] = clear_now
+            by_cost = sorted(priced, key=lambda L: L["owed"] * L["rate"], reverse=True)
+            lines.append(f"Debt ${total:,} across {len(book)} shark(s); "
+                         f"+${next_day:,}/day interest.")
+            lines.append("  Repay costliest first: "
+                         + ", ".join(f"{L['shark']} ${L['owed']:,}@{L['rate']}%" for L in by_cost))
+            lines.append(f"  Clear all now ~${clear_now:,}.")
+            due_soon = [L for L in priced if L.get("days_left") is not None]
+            if due_soon:
+                s = min(due_soon, key=lambda L: L["days_left"])
+                if s["days_left"] <= 1:
+                    lines.append(f"  ⚠ {s['shark']} due in {s['days_left']}d "
+                                 f"(${s['owed']:,}@{s['rate']}%) — repay or it compounds.")
+        elif total:
+            lines.append(f"Debt ${total:,} outstanding — per-shark terms unread; "
+                         f"run `dl2 loan` to read the shark window.")
+        if game_days_left is not None and game_days_left <= 3 and (total or 0) > 0:
+            lines.append(f"  ⚠ {game_days_left} day(s) left — clear debt before the "
+                         f"end (final score subtracts it).")
+
+    # ---- (b) loan-to-promote --------------------------------------------
+    promote = _strategy.evaluate_loan_to_promote(
+        {"cash": cash, "bank": bank, "promotions": list(promotions or [])},
+        value_per_extra_day)
+    if promote.get("take"):
+        lines.append(
+            f"Loan-to-promote PAYS: borrow ${promote['loan']:,} from {promote['shark']} "
+            f"({promote['rate']}%/day) → reach {promote['target_rank']} "
+            f"(+{promote['extra_days']}d); interest ~${promote['interest_cost']:,} < "
+            f"extra-day value ~${promote['benefit']:,.0f}. "
+            f"(advisory — `dl2 loan borrow \"{promote['shark']}\" {promote['loan']}`)")
+    else:
+        lines.append(f"No promotional loan ({promote.get('reason')}).")
+
+    return {"lines": lines, "repay": repay, "promote": promote}
 
 
 def _arb_legs(buy_market, sell_prices, rate, safety, cash, free):
@@ -2082,6 +2182,322 @@ def ship_main():
         print("Now FLY there, then `dl2 sell`.")
 
 
+# ===========================================================================
+# Loans — read the shark window, advise, and (with confirmation) borrow/repay.
+# Borrow/repay DRIVE the screen and move money / take on compounding debt, so the
+# SHARED-SCREEN PROTOCOL applies and we ALWAYS confirm before executing.
+# ===========================================================================
+def _confirm(prompt):
+    """Interactive y/N confirmation for a money-moving action. Defaults to No on
+    EOF (non-interactive), so an action never fires without an explicit yes."""
+    try:
+        return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def _crosscheck_loan_rates(loans):
+    """Log (never override) any shark whose OCR-read rate/term disagrees with the
+    decoded model table. The screen is authoritative; the model is the sanity check."""
+    for name, info in (loans.get("sharks") or {}).items():
+        exp = _C.LOAN_SHARKS.get(name)
+        if not exp:
+            continue
+        if info.get("rate") is not None and info["rate"] != exp[1]:
+            print(f"  ⚠ loan-rate discrepancy: {name} read {info['rate']}% vs model "
+                  f"{exp[1]}% (using the read).", file=sys.stderr)
+        if info.get("due") is not None and info["due"] != exp[2]:
+            print(f"  ⚠ loan-term discrepancy: {name} read {info['due']}d vs model "
+                  f"{exp[2]}d (using the read).", file=sys.stderr)
+
+
+# Places -> Finances opens ONE window titled "Dialog": the bank section (Deposit/
+# Withdraw) on top and the loan-shark table (Name | mult | Rate | Days | Debt |
+# Days Left, with Borrow.../Repay/Done buttons) below.
+FIN_TITLE = "Dialog"
+
+
+def _finances_state():
+    """Read the Finances ("Dialog") window; return the parsed state only if the loan
+    table is actually present. When no dialog is open, dl2read falls back to the
+    main window (no shark rows / Borrow button) -> None, so this doubles as an
+    "is the Finances window open?" check."""
+    st = _read(window=FIN_TITLE)
+    if not st:
+        return None
+    boxes = st["_ocr"]["boxes"]
+    if any(parser._clean_shark(b["text"]) for b in boxes) or \
+       any("Borrow" in b["text"] for b in boxes):
+        return st
+    return None
+
+
+def _open_finances():
+    """Main window: Places... -> Finances (index 0 of the Places popup — the same
+    popup open_shipping drives). Returns True once the Finances window is open."""
+    for _ in range(3):
+        if _finances_state():
+            return True
+        base = _read(window="Drug Lord")
+        if not base:
+            time.sleep(0.2); continue
+        mx, cx, my, cy = calibrate(base["_ocr"]["frame"], "Drug Lord")
+        places = _find_btn(base["_ocr"]["boxes"], ["places", "laces"])
+        if not places:
+            continue
+        click(int((places["x"] + places.get("w", 40) / 2 - cx) / mx),
+              int((places["y"] + places.get("h", 12) / 2 - cy) / my))
+        time.sleep(0.6)
+        menu = _popup_menu()
+        if not menu:
+            continue
+        b = menu["bounds"]                       # Finances(=0), Shopping, Hospital, Vault, Shipping
+        click(int(b["x"] + b["w"] * 0.5), int(b["y"] + b["h"] * (0 + 0.5) / 5))
+        time.sleep(0.9)
+    return bool(_finances_state())
+
+
+def _read_loan_window(tries=15):
+    """Open Finances and read the loan-shark table. Returns (loans, ocr, cal, title)
+    or (None, None, None, None). Cross-checks the OCR rates against the model."""
+    if not _open_finances():
+        return None, None, None, None
+    for _ in range(tries):
+        st = _finances_state()
+        if st:
+            loans = parser.parse_loan_window(st["_ocr"])
+            if loans["sharks"] or loans["total_debt"] is not None:
+                _crosscheck_loan_rates(loans)
+                cal = calibrate(st["_ocr"]["frame"], FIN_TITLE)
+                return loans, st["_ocr"], cal, FIN_TITLE
+        time.sleep(0.1)
+    return None, None, None, None
+
+
+def _close_loan_window(title=FIN_TITLE):
+    """Click the Finances window's Done button so the main window is usable again."""
+    st = _read(window=title)
+    if not st:
+        return
+    close = next((b for b in st["_ocr"]["boxes"]
+                  if b["text"].strip() in ("Done", "Close", "Cancel")), None)
+    if close:
+        cal = calibrate(st["_ocr"]["frame"], title)
+        click(*screen_of(close["x"] + close.get("w", 40) / 2,
+                         close["y"] + close.get("h", 12) / 2, cal))
+        time.sleep(0.8)
+
+
+def _popup_window(titles):
+    """A game window whose title contains any of `titles` (case-insensitive)."""
+    for w in _game_windows():
+        t = (w.get("title") or "").lower()
+        if any(k in t for k in titles):
+            return w
+    return None
+
+
+def _drive_loan(action, shark, amt=None, title=FIN_TITLE):
+    """DRIVE the Finances window (verified live 2026-09-24). Both actions select the
+    shark's row first, then:
+
+      repay  — click 'Repay' (no ellipsis): the game repays the WHOLE selected loan.
+               A 'Drug Lord 2' message box shows the principal + early-payment fee;
+               Return finalizes it. There is NO partial repay. `amt` is unused.
+      borrow — click 'Borrow...': the 'Borrowing from <shark>' dialog takes an
+               amount ('How much to borrow?', OK/Cancel). Clear, type `amt`, OK.
+    """
+    st = _finances_state()
+    if not st:
+        print("  couldn't re-read the Finances window to act.", file=sys.stderr)
+        return False
+    ocr, cal = st["_ocr"], calibrate(st["_ocr"]["frame"], title)
+    row = next((b for b in ocr["boxes"]
+                if 290 <= b["x"] <= 370 and parser._clean_shark(b["text"]) == shark), None)
+    if not row:
+        print(f"  {shark}: not found in the shark list — can't {action}.", file=sys.stderr)
+        return False
+    click(*screen_of(row["x"] + row.get("w", 40) / 2, row["y"] + row.get("h", 12) / 2, cal))
+    time.sleep(0.5)
+    # click the action button (OCR: "Borrow..." / "Repay")
+    st2 = _finances_state()
+    btn = next((b for b in (st2["_ocr"]["boxes"] if st2 else [])
+                if b["text"].strip().lower().rstrip(".").startswith(action)), None)
+    if not btn:
+        print(f"  no {action} button found — aborting.", file=sys.stderr)
+        return False
+    bcal = calibrate(st2["_ocr"]["frame"], title)
+    click(*screen_of(btn["x"] + btn.get("w", 40) / 2, btn["y"] + btn.get("h", 12) / 2, bcal))
+    time.sleep(0.9)
+
+    if action == "repay":
+        if not _popup_window(["drug lord 2"]):       # the confirm message box
+            print("  repay confirmation didn't appear — aborting (nothing repaid).",
+                  file=sys.stderr)
+            return False
+        subprocess.run([INPUT, "key", "36"], capture_output=True); time.sleep(0.9)     # Return = OK
+        audit.record("loan_repay", shark=shark, amount="full")
+        return True
+
+    # borrow: the "Borrowing from <shark>" dialog takes an amount.
+    if not _popup_window(["borrowing"]):
+        print("  borrow amount dialog didn't appear — aborting (no loan taken).",
+              file=sys.stderr)
+        return False
+    for _ in range(12):
+        subprocess.run([INPUT, "key", "51"], capture_output=True); time.sleep(0.02)    # Backspace
+    subprocess.run([INPUT, "num", str(int(amt))], capture_output=True); time.sleep(0.3)
+    subprocess.run([INPUT, "key", "36"], capture_output=True); time.sleep(0.9)         # Return = OK
+    # some amounts trigger a follow-up "Drug Lord 2" confirmation — accept it too.
+    if _popup_window(["drug lord 2"]):
+        subprocess.run([INPUT, "key", "36"], capture_output=True); time.sleep(0.8)
+    audit.record("loan_borrow", shark=shark, amount=int(amt))
+    return True
+
+
+def loan_main():
+    """`dl2 loan [status | borrow <shark> <amount> | repay [shark]] [--yes]`.
+
+      status (default)  READ-ONLY: open the Finances window, print every lender's
+                        terms + your outstanding loans and a repay-by-day advisory.
+      borrow <shark> <amount>   take a loan (compounding debt). Prints the plan and
+                        CONFIRMS before driving the screen.
+      repay [shark]     repay a shark's loan IN FULL (the game has no partial
+                        repay); defaults to the costliest loan. Prints the plan
+                        (principal + early-payment fee) and CONFIRMS.
+
+    You can owe several sharks at once. Borrow/repay move money and take on / clear
+    compounding debt, so they always confirm first (skip with --yes)."""
+    args = [a for a in sys.argv[1:] if a != "loan"]
+    assume_yes = False
+    for f in ("--yes", "-y"):
+        while f in args:
+            args.remove(f); assume_yes = True
+    sub = args[0].lower() if args else "status"
+    if sub not in ("status", "borrow", "repay"):
+        sys.exit("usage: dl2 loan [status | borrow <shark> <amount> | repay [shark]]")
+
+    # Make the main window usable (close the World window if the last sweep left it
+    # up) and read the Status box BEFORE opening Finances (which covers it).
+    if world_is_open():
+        w = _read(window="World")
+        if w:
+            close_world(calibrate(w["_ocr"]["frame"]))
+        time.sleep(0.3)
+    status = read_status_from_main()
+
+    loans, ocr, cal, title = _read_loan_window()
+    if loans is None:
+        sys.exit("Couldn't open/read the loan-shark window (Places -> Finances). "
+                 "Bring Drug Lord frontmost, hands off, and retry.")
+    # Persist for `dl2 decide` (compute-only loan advice reads this cache).
+    total = loans.get("total_debt") if loans.get("total_debt") is not None else status.get("debt")
+    try:
+        json.dump({**loans, "day": status.get("day"),
+                   "total_days": status.get("total_days")}, open(LOAN_STATE_PATH, "w"))
+    except Exception:
+        pass
+
+    cash = int(status.get("cash") or 0)
+    if not cash:                                 # the Finances window itself shows "Cash:"
+        cash = int((parser.parse(ocr).get("status") or {}).get("cash") or 0)
+    book = loans.get("loans") or []
+    owed_of = {L["shark"]: L["owed"] for L in book}
+
+    # ---- shark table (always shown) — you can owe several at once --------
+    print("\n=== Loan sharks (max loan = mult x cash) ===")
+    for name in parser.CANON_SHARKS:
+        s = loans["sharks"].get(name) or {}
+        mult, exp_rate, exp_due = _C.LOAN_SHARKS[name]
+        rate = s.get("rate") if s.get("rate") is not None else exp_rate
+        due = s.get("due") if s.get("due") is not None else exp_due
+        owed = owed_of.get(name) or 0
+        tail = f"  OWE ${owed:,}" if owed else ""
+        print(f"  {name:20s} {rate:>3}%/day  due {due}d  max ${_finance.max_loan(cash, name):>12,}{tail}")
+    if total:
+        print(f"\nTotal debt: ${total:,}")
+        la = loan_advisory({**status, "debt": total}, loans, 0)
+        for ln in la["lines"]:
+            if "promotional loan" in ln or "Loan-to-promote" in ln:
+                continue                         # the promote verdict belongs to `dl2 decide`
+            print("  " + ln)
+    else:
+        print("\nNo current loans.")
+
+    if sub == "status":
+        _close_loan_window()
+        return
+
+    # ---- borrow / repay (drives the screen — confirm first) -------------
+    if sub == "borrow":
+        if len(args) < 3:
+            _close_loan_window(); sys.exit("usage: dl2 loan borrow <shark> <amount>")
+        shark = parser._clean_shark(args[1]) or args[1]
+        if shark not in _C.LOAN_SHARKS:
+            _close_loan_window()
+            sys.exit(f"Unknown shark '{args[1]}'. Options: {', '.join(_C.LOAN_SHARKS)}")
+        try:
+            amt = int(args[2].replace(",", "").replace("$", ""))
+        except ValueError:
+            _close_loan_window(); sys.exit(f"Bad amount '{args[2]}'.")
+        if amt <= 0:
+            _close_loan_window(); sys.exit("Amount must be positive.")
+        maxl = _finance.max_loan(cash, shark)
+        if amt > maxl:
+            _close_loan_window()
+            sys.exit(f"{shark} lends at most ${maxl:,} on ${cash:,} cash "
+                     f"({_C.LOAN_SHARKS[shark][0]}x); you asked ${amt:,}.")
+        rate, due = _C.LOAN_SHARKS[shark][1], _C.LOAN_SHARKS[shark][2]
+        grown = _finance.debt_after_days(amt, rate, due)
+        print(f"\nBORROW ${amt:,} from {shark} @ {rate}%/day (due {due}d).")
+        print(f"  The new loan grows to ${grown:,} by day {due} if unpaid; "
+              f"total debt would be ${int(total or 0) + amt:,}.")
+        if not (assume_yes or _confirm(f"Borrow ${amt:,} from {shark}?")):
+            print("Aborted — no loan taken."); _close_loan_window(); return
+        ok = _drive_loan("borrow", shark, amt)
+    else:  # repay — the game repays a shark's loan IN FULL (no partial repay)
+        if not book:
+            _close_loan_window(); sys.exit("No outstanding loans to repay.")
+        target = parser._clean_shark(args[1]) if len(args) >= 2 else None
+        if len(args) >= 2 and target is None:
+            _close_loan_window()
+            sys.exit(f"Unknown shark '{args[1]}'. Options: {', '.join(_C.LOAN_SHARKS)}")
+        if target is None:                           # default: the costliest loan
+            target = max(book, key=lambda L: (L["owed"] or 0) * (L.get("rate") or 0))["shark"]
+            print(f"  (no shark given — repaying the costliest loan, {target})", file=sys.stderr)
+        owed_here = owed_of.get(target)
+        if not owed_here:
+            _close_loan_window(); sys.exit(f"No outstanding loan with {target}.")
+        rate = _C.LOAN_SHARKS[target][1]
+        cost = _finance.early_payment_total(owed_here, rate)   # principal + early-pay fee
+        if cost > cash:
+            _close_loan_window()
+            sys.exit(f"Repaying {target} in full costs ~${cost:,} (incl. early-pay fee) "
+                     f"but you have ${cash:,} cash — withdraw from the bank first.")
+        print(f"\nREPAY {target} IN FULL: ${owed_here:,} principal + "
+              f"~${cost - owed_here:,} early-payment fee = ~${cost:,} cash.")
+        print(f"  Total debt ${int(total or 0):,} -> ${int(total or 0) - owed_here:,}.")
+        if not (assume_yes or _confirm(f"Repay {target} in full (~${cost:,})?")):
+            print("Aborted — nothing repaid."); _close_loan_window(); return
+        ok = _drive_loan("repay", target)
+
+    # Re-read to confirm and refresh the cache, then close.
+    mark = "✓" if ok else "⚠"
+    after, _o, _c, _t = _read_loan_window(tries=8)
+    if after is not None:
+        try:
+            json.dump({**after, "day": status.get("day"),
+                       "total_days": status.get("total_days")}, open(LOAN_STATE_PATH, "w"))
+        except Exception:
+            pass
+        nd = after.get("total_debt")
+        tail = f"${nd:,}" if nd is not None else "unread — verify on screen"
+        print(f"\n{mark} {sub} done; total debt now {tail}.")
+    else:
+        print(f"\n{mark} {sub} sent; couldn't re-read to confirm — check the screen.")
+    _close_loan_window()
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1:]
     if "audit" in cmd:
@@ -2090,6 +2506,8 @@ if __name__ == "__main__":
         _audit.main()
     elif "ship" in cmd:
         ship_main()
+    elif "loan" in cmd:
+        loan_main()
     elif "buy" in cmd:
         buy_main()
     elif "sell" in cmd:

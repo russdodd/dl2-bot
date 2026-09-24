@@ -30,6 +30,12 @@ CANON_CITIES = ["Austin, USA", "Beijing, China", "Boston, USA", "Detroit, USA",
                 "Vancouver, Canada"]
 CITY_SHORT = [c.split(",")[0] for c in CANON_CITIES]
 
+# Loan sharks (the five lenders). Kept here as OCR-canon names (like CANON_DRUGS/
+# CANON_CITIES) so parse.py stays screen-free and dl2model-free; the caller cross-
+# checks the OCR-read rate/due against dl2model.finance.LOAN_SHARKS.
+CANON_SHARKS = ["Odd Lenny", "One-eyed Wilbur", "Laughing Max",
+                "Strange ear Leonard", "Buddles"]
+
 _HOMOGLYPH = str.maketrans({"Р": "P", "С": "C", "Т": "T", "А": "A", "В": "B",
                             "Е": "E", "К": "K", "М": "M", "Н": "H", "О": "O",
                             "Х": "X", "у": "y", "р": "p", "с": "c"})
@@ -61,6 +67,99 @@ def _clean_city(text):
         return m[0]
     m = difflib.get_close_matches(text.strip(), CITY_SHORT, n=1, cutoff=0.5)
     return CANON_CITIES[CITY_SHORT.index(m[0])] if m else None
+
+
+def _clean_shark(text):
+    """Fuzzy-match an OCR fragment to a canonical loan-shark name, or None."""
+    t = text.translate(_HOMOGLYPH).strip()
+    t = re.sub(r"^[^A-Za-z]+", "", t).strip()
+    if not t:
+        return None
+    for s in CANON_SHARKS:
+        if t.lower() == s.lower():
+            return s
+    m = difflib.get_close_matches(t, CANON_SHARKS, n=1, cutoff=0.6)
+    return m[0] if m else None
+
+
+# Loan table column x-bands, from the live "Dialog" (Places -> Finances) window.
+# Header row: Name | P... (max-loan multiplier) | R.. (rate%) | Days (term) |
+# Debt (owed to that shark) | Days Left. The panel prints BARE numbers (no "%"/
+# "day" suffix), so columns are located by x, not by text. Bounds are the
+# midpoints between the observed value columns (mult~502 rate~540 days~606
+# owed~675 daysleft~806); numeric loan cells start at x>=490 (left of that is the
+# main window's inventory bleeding through).
+_LOAN_COL_BANDS = [("mult", 490, 521), ("rate", 521, 573), ("due", 573, 640),
+                   ("owed", 640, 740), ("days_left", 740, 10 ** 9)]
+
+
+def _loan_int(text):
+    """Int from an OCR loan cell: keep digits/commas, drop stray glyphs ("'1"->1,
+    "12,800"->12800). Returns None if there is no digit."""
+    m = re.search(r"\d[\d,]*", text.translate(_HOMOGLYPH))
+    return int(m.group(0).replace(",", "")) if m else None
+
+
+def parse_loan_window(ocr):
+    """Parse the loan-shark section of the Finances ("Dialog") window OCR.
+
+    You can owe several sharks at once, so this reads a PORTFOLIO of loans, one row
+    per shark:
+      sharks[name] = {"mult", "rate", "due", "owed", "days_left"}  (any may be None)
+    plus:
+      total_debt   int|None   — the "Debt: N" total at the bottom of the panel
+      loans        list       — [{shark, owed, rate, due, days_left}] for owed>0
+      lender/principal/rate/due_in — single-loan back-compat: the MOST URGENT
+                   outstanding loan (soonest days_left, then highest rate);
+                   principal = total_debt.
+
+    Columns carry BARE numbers (no "%"/"day" text), so cells are placed by x-band
+    (_LOAN_COL_BANDS) and rows by nearest shark-name y. Robust to the OCR dropping
+    individual cells (common on the term / days-left / multiplier columns).
+    """
+    boxes = ocr.get("boxes", [])
+
+    # shark-name anchors (left column of the loan table, x ~300-360)
+    anchors = [(b, _clean_shark(b["text"])) for b in boxes
+               if 290 <= b["x"] <= 370 and _clean_shark(b["text"])]
+    sharks = {name: {"mult": None, "rate": None, "due": None,
+                     "owed": None, "days_left": None} for _, name in anchors}
+
+    # assign each numeric loan cell (x>=490, within the table's y-span) to the
+    # nearest shark row, then to a column by its x-band.
+    for b in boxes:
+        if b["x"] < 490:
+            continue
+        val = _loan_int(b["text"])
+        if val is None:
+            continue
+        near = min(anchors, key=lambda a: abs(a[0]["y"] - b["y"]), default=None)
+        if not near or abs(near[0]["y"] - b["y"]) > 12:
+            continue
+        col = next((c for c, lo, hi in _LOAN_COL_BANDS if lo <= b["x"] < hi), None)
+        if col and sharks[near[1]][col] is None:
+            sharks[near[1]][col] = val
+
+    # total debt: the "Debt: 32,580" summary line. Require the COLON so it can't
+    # match the bare "Debt" column header (which is followed by the first owed cell).
+    total_debt = None
+    md = re.search(r"Debt:\s*\$?([\d][\d.,]*)",
+                   "  ".join(b["text"] for b in boxes))
+    if md:
+        total_debt = int(re.sub(r"[.,]", "", md.group(1)))
+
+    loans = [{"shark": name, "owed": s["owed"], "rate": s["rate"],
+              "due": s["due"], "days_left": s["days_left"]}
+             for name, s in sharks.items() if (s["owed"] or 0) > 0]
+    # most-urgent outstanding loan for the single-loan back-compat fields
+    urgent = min(loans, key=lambda L: (L["days_left"] if L["days_left"] is not None else 999,
+                                       -(L["rate"] or 0)), default=None)
+
+    return {"sharks": sharks, "total_debt": total_debt, "loans": loans,
+            "lender": urgent["shark"] if urgent else None,
+            "principal": total_debt,
+            "rate": urgent["rate"] if urgent else None,
+            "due_in": urgent["days_left"] if urgent else None}
 
 
 def _rows(boxes, ytol=12):
