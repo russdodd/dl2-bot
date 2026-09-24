@@ -82,79 +82,84 @@ def _clean_shark(text):
     return m[0] if m else None
 
 
+# Loan table column x-bands, from the live "Dialog" (Places -> Finances) window.
+# Header row: Name | P... (max-loan multiplier) | R.. (rate%) | Days (term) |
+# Debt (owed to that shark) | Days Left. The panel prints BARE numbers (no "%"/
+# "day" suffix), so columns are located by x, not by text. Bounds are the
+# midpoints between the observed value columns (mult~502 rate~540 days~606
+# owed~675 daysleft~806); numeric loan cells start at x>=490 (left of that is the
+# main window's inventory bleeding through).
+_LOAN_COL_BANDS = [("mult", 490, 521), ("rate", 521, 573), ("due", 573, 640),
+                   ("owed", 640, 740), ("days_left", 740, 10 ** 9)]
+
+
+def _loan_int(text):
+    """Int from an OCR loan cell: keep digits/commas, drop stray glyphs ("'1"->1,
+    "12,800"->12800). Returns None if there is no digit."""
+    m = re.search(r"\d[\d,]*", text.translate(_HOMOGLYPH))
+    return int(m.group(0).replace(",", "")) if m else None
+
+
 def parse_loan_window(ocr):
-    """Parse the loan-shark / Finances window OCR into loan state.
+    """Parse the loan-shark section of the Finances ("Dialog") window OCR.
 
-    Returns:
-      {
-        "sharks": {name: {"rate": int_pct|None, "due": int_days|None}},
-        "lender": str|None,      # who you currently owe
-        "principal": int|None,   # outstanding debt shown in this window
-        "rate": int|None,        # your current loan's daily interest %
-        "due_in": int|None,      # days remaining until it's due
-      }
+    You can owe several sharks at once, so this reads a PORTFOLIO of loans, one row
+    per shark:
+      sharks[name] = {"mult", "rate", "due", "owed", "days_left"}  (any may be None)
+    plus:
+      total_debt   int|None   — the "Debt: N" total at the bottom of the panel
+      loans        list       — [{shark, owed, rate, due, days_left}] for owed>0
+      lender/principal/rate/due_in — single-loan back-compat: the MOST URGENT
+                   outstanding loan (soonest days_left, then highest rate);
+                   principal = total_debt.
 
-    Layout assumptions (confirm against the live window; the parser is tolerant so
-    a small tweak should suffice if the real layout differs):
-      * A table with one row per shark; each row has the shark's name, its daily
-        interest as "NN%", and its term as "N day(s)".
-      * A current-loan summary somewhere containing a "$" principal, the lender's
-        (shark) name, an "NN%" rate, and "due in N day(s)" (or "N days remaining").
-        Any of these may be absent; principal falls back to the Status-box debt in
-        the caller.
+    Columns carry BARE numbers (no "%"/"day" text), so cells are placed by x-band
+    (_LOAN_COL_BANDS) and rows by nearest shark-name y. Robust to the OCR dropping
+    individual cells (common on the term / days-left / multiplier columns).
     """
     boxes = ocr.get("boxes", [])
 
-    # ---- shark table: rows carrying a shark name -> its rate% and term days ----
-    sharks = {}
-    for r in _rows(boxes):
-        name = next((_clean_shark(b["text"]) for b in r["items"]
-                     if _clean_shark(b["text"])), None)
-        if not name:
-            continue
-        row_text = " ".join(b["text"] for b in r["items"])
-        if "$" in row_text:                  # the current-loan summary, not a table row
-            continue
-        mr = re.search(r"(\d{1,3})\s*%", row_text)
-        md = re.search(r"(\d{1,3})\s*day", row_text, re.I)
-        sharks[name] = {"rate": int(mr.group(1)) if mr else None,
-                        "due": int(md.group(1)) if md else None}
+    # shark-name anchors (left column of the loan table, x ~300-360)
+    anchors = [(b, _clean_shark(b["text"])) for b in boxes
+               if 290 <= b["x"] <= 370 and _clean_shark(b["text"])]
+    sharks = {name: {"mult": None, "rate": None, "due": None,
+                     "owed": None, "days_left": None} for _, name in anchors}
 
-    # ---- current loan: the summary region mentioning the outstanding debt ----
-    # Anchor on a box whose text flags the current loan ("owe" / "current loan" /
-    # "borrowed" / "outstanding"), then read that box's row plus the row just below
-    # it as one region and pull principal / lender / rate / due from it.
-    lender = principal = rate = due_in = None
-    anchor = next((b for b in boxes
-                   if re.search(r"owe|current loan|borrowed|outstanding", b["text"], re.I)), None)
-    if anchor:
-        region = [b for b in boxes if -6 <= (b["y"] - anchor["y"]) <= 40]
-    else:
-        region = boxes
-    region_text = " ".join(b["text"] for b in sorted(region, key=lambda b: (b["y"], b["x"])))
-    mp = re.search(r"\$\s*([\d.,]{2,})", region_text)
-    if mp:
-        principal = int(re.sub(r"[.,]", "", mp.group(1)))
-    lender = next((_clean_shark(b["text"]) for b in region
-                   if _clean_shark(b["text"])), None)
-    mr = re.search(r"(\d{1,3})\s*%", region_text)
-    if mr:
-        rate = int(mr.group(1))
-    md = re.search(r"due\s+in\s+(\d{1,3})|(\d{1,3})\s*days?\s*(?:remaining|left|until due|to go)",
-                   region_text, re.I)
+    # assign each numeric loan cell (x>=490, within the table's y-span) to the
+    # nearest shark row, then to a column by its x-band.
+    for b in boxes:
+        if b["x"] < 490:
+            continue
+        val = _loan_int(b["text"])
+        if val is None:
+            continue
+        near = min(anchors, key=lambda a: abs(a[0]["y"] - b["y"]), default=None)
+        if not near or abs(near[0]["y"] - b["y"]) > 12:
+            continue
+        col = next((c for c, lo, hi in _LOAN_COL_BANDS if lo <= b["x"] < hi), None)
+        if col and sharks[near[1]][col] is None:
+            sharks[near[1]][col] = val
+
+    # total debt: the "Debt: 32,580" summary line. Require the COLON so it can't
+    # match the bare "Debt" column header (which is followed by the first owed cell).
+    total_debt = None
+    md = re.search(r"Debt:\s*\$?([\d][\d.,]*)",
+                   "  ".join(b["text"] for b in boxes))
     if md:
-        due_in = int(md.group(1) or md.group(2))
+        total_debt = int(re.sub(r"[.,]", "", md.group(1)))
 
-    # If the current-loan rate/due weren't spelled out but we know the lender, take
-    # them from that shark's table row (still OCR-sourced, not the model).
-    if lender and lender in sharks:
-        if rate is None:
-            rate = sharks[lender]["rate"]
-        if due_in is None:
-            due_in = sharks[lender]["due"]
+    loans = [{"shark": name, "owed": s["owed"], "rate": s["rate"],
+              "due": s["due"], "days_left": s["days_left"]}
+             for name, s in sharks.items() if (s["owed"] or 0) > 0]
+    # most-urgent outstanding loan for the single-loan back-compat fields
+    urgent = min(loans, key=lambda L: (L["days_left"] if L["days_left"] is not None else 999,
+                                       -(L["rate"] or 0)), default=None)
 
-    return {"sharks": sharks, "lender": lender, "principal": principal,
-            "rate": rate, "due_in": due_in}
+    return {"sharks": sharks, "total_debt": total_debt, "loans": loans,
+            "lender": urgent["shark"] if urgent else None,
+            "principal": total_debt,
+            "rate": urgent["rate"] if urgent else None,
+            "due_in": urgent["days_left"] if urgent else None}
 
 
 def _rows(boxes, ytol=12):
