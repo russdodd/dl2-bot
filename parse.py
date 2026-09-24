@@ -32,7 +32,7 @@ CITY_SHORT = [c.split(",")[0] for c in CANON_CITIES]
 
 # Loan sharks (the five lenders). Kept here as OCR-canon names (like CANON_DRUGS/
 # CANON_CITIES) so parse.py stays screen-free and dl2model-free; the caller cross-
-# checks the OCR-read rate/due against dl2model.finance.LOAN_SHARKS.
+# checks the OCR-read rate/due against dl2model.constants.LOAN_SHARKS.
 CANON_SHARKS = ["Odd Lenny", "One-eyed Wilbur", "Laughing Max",
                 "Strange ear Leonard", "Buddles"]
 
