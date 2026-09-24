@@ -104,25 +104,33 @@ class Game:
             market.quantity = stock.event_glut_quantity(market.quantity, self.rng)
 
     def _ordinary_event_roll(self, market, M):
-        """The unconditional 2% market event: 1% shortage, 1% glut."""
-        r = self.rng.rand_mod(100)
-        if r == 0:
-            self._apply_event(market, +1, M)
-        elif r == 1:
-            self._apply_event(market, -1, M)
+        """The unconditional ~2% market event: ~1% shortage, ~1% glut.
+
+        decode-reference §4c (0x4053F0-0x405416): rand%50==0 fires the event
+        (656/32768 = 2.0020%); direction is a SECOND draw (rand%2) taken only
+        when it fires (1.0010% shortage / 1.0010% glut)."""
+        if self.rng.rand_mod(50) == 0:
+            direction = +1 if self.rng.rand_mod(2) == 0 else -1
+            self._apply_event(market, direction, M)
 
     def _roll_event(self, market, M, scheduled):
         """Decide today's event for a market. With a rumor scheduled for it, use
         the 70/20/10 rule (70% predicted, 20% nothing-but-ordinary-roll, 10%
-        opposite); otherwise just the ordinary 2% roll."""
+        opposite); otherwise just the ordinary 2% roll.
+
+        decode-reference §4a (rumor_step 0x4040B6-0x4040E6): the scheduler draws
+        rand%10 -> predicted for 0..6 (22939/32768 = 70.0043%), nothing for 7..8
+        (6553/32768 = 19.9982%), opposite for 9 (3276/32768 = 9.9976%). The 70/20/10
+        is applied at consumption time (day D+1), and the "nothing" branch still
+        runs the ordinary roll same-day."""
         if scheduled is None:
             self._ordinary_event_roll(market, M)
             return
-        roll = self.rng.rand_mod(100)
-        if roll < 70:
+        roll = self.rng.rand_mod(10)
+        if roll <= 6:
             self._apply_event(market, scheduled, M)
-        elif roll < 90:
-            self._ordinary_event_roll(market, M)   # the 20% "nothing" branch
+        elif roll <= 8:
+            self._ordinary_event_roll(market, M)   # the "nothing" branch
         else:
             self._apply_event(market, -scheduled, M)
 
