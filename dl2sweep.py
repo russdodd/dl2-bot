@@ -1063,6 +1063,9 @@ def decide_main():
     if la["lines"]:
         print("\n" + "=" * 66)
         print("(5) LOAN ADVISORY (advisory only — never auto-borrows):")
+        if la["promote"].get("take"):
+            print(f"    [loan-to-promote assumes ~${vpd:,.0f}/day trading value = "
+                  f"the best buy-arb net to {dests[0]['city'].split(',')[0]}]")
         for ln in la["lines"]:
             print("    " + ln)
 
