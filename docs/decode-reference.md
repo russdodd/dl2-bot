@@ -9,9 +9,9 @@ executable again.
 **Verdict up front:** the decode *validates* the model's core transition
 mechanics almost letter-for-letter. Two small probability/RNG bugs were found
 (§7 Corrections). Everything else that differs is **RNG-stream sync detail**,
-which the Monte-Carlo planner does not need (§8). One structural question is
-still open (§9, the 6 market slots) — **the multi-day build is on hold until it
-is answered.**
+which the Monte-Carlo planner does not need (§8). The 6-market-slot question is
+**resolved** (§9): the player only ever trades slot 0, so the 255-market model
+is the exact tradeable world and **the multi-day build is unblocked.**
 
 ---
 
@@ -167,7 +167,7 @@ frequency/direction, §4a 1-day-once lead time, MSVC constants.
 |---|-------|-----------|----------------|-------|
 | 1 | `simulator._roll_event` | `rand_mod(100)`, cutoffs 70/90 | `rand_mod(10)`, `≤6 / 7-8 / 9` | **Planning** (tiny: 70.06→70.004%) |
 | 2 | `simulator._ordinary_event_roll` | one `rand_mod(100)` (`==0`/`==1`) | `rand%50==0` then `rand%2` | Seed-sync (prob ~identical; draw count differs) |
-| 3 | `simulator.world` / `step_day` | 15×17 = 255 markets | 15×**6**×17 = 1530 (5 hidden slots/city) | **Open — §9** |
+| 3 | `simulator.world` / `step_day` | 15×17 = 255 markets | 15×**6**×17 = 1530 (5 hidden slots/city) | Seed-sync only (§9: player trades slot 0; 255 is the exact economic world) |
 | 4 | `stock.is_listed` call site | drawn for every market | active slot only | Seed-sync |
 | 5 | `simulator.step_day` order | shipments→markets→rumors→finance | health→event-dispatch→markets→loan→rank→shipments→rumors | Seed-sync |
 
@@ -178,17 +178,43 @@ stream. Exact seed recovery from live OCR is impractical anyway. The decode
 validated the *transition mechanics*, which is all the sampler needs. Only
 correction #1 measurably moves planning EV, by ~0.06pp.
 
-## 9. OPEN QUESTION — what is a "market slot"? (build is on hold for this)
-The executable keeps **6 slots per city** (1 active + 5 hidden); the listing
-draw (§7a, `rand%3`, ~⅔ listed) fires only for the active slot. Planning-
-relevant question for the next decode pass:
+## 9. RESOLVED — the 6 market slots (decode pass 2026-09-24)
+The 6 slots are **6 persistent parallel market structures per city** — a
+vestigial "neighborhood/area" feature (Austin slot 0 = `"West Lk Hills"`,
+slot 1 = `"Downtown"`; other slots hold placeholders `"a".."f"`). It is **not
+exposed** in DL2.2.
 
-> **Does the drug/market the player can actually trade in a city rotate among
-> the 6 slots day-to-day, or is the active slot stable?** If the tradeable
-> market rotates (which would explain per-day listing randomness), that changes
-> which prices are *accessible* each day and must be in the world model. If the
-> active slot is stable per city, the 255-market (active-slot) view is exactly
-> the tradeable world and the planner is fully clear.
+**City memory layout** (`0xA88` bytes/city): name `+0x00`, country `+0x40`,
+coord `+0x80`, price-mult `+0x84`, then 6 slots of `0x194` at `+0x88, +0x21C,
++0x3B0, +0x544, +0x6D8, +0x86C`. Each slot: `name[64]` + 17 drug records of
+`0x14` bytes = `{quantity+0x00, price+0x04, target+0x08, pending_event+0x0C,
+aux+0x10}`. Record address:
+`WORLD_BASE + city*0xA88 + slot*0x194 + drug*0x14`.
+
+**The player only ever trades slot 0.** The global slot selector `0x42AD7C` is
+written `= 0` once at new-game init (`0x40600B`) and **never changed** — no UI,
+day, city, or travel code writes it. Buy (`0x409C80`) and Sell (`0x409FB0`) both
+index `world[current_city][slot=0][drug]`. Rumors also target slot 0 of their
+city (`0x404080`, `0x4041A1`). `market_step` only runs the UI/listing logic for
+the slot matching `0x42AD7C` (`0x4054A2`), i.e. slot 0 of the current city.
+
+**⇒ Economic world model is `markets[15][17]` (255), not `[15][6][17]`.** No slot
+rotation; accessible prices never jump between parallel markets. Slots 1–5 still
+evolve and consume RNG — they matter **only** for byte-exact seed reproduction.
+
+**`listed` is NOT a persistent field** — there is no listing field in the `0x14`
+record. It is ephemeral UI availability, rolled fresh each day for the current
+city × slot 0 only (`0x4055A5`):
+```python
+listed_today = (pending_event != 0) or (rand() % 3 != 0)   # event ⇒ always listed; else 2/3
+```
+So staying in Boston two days keeps you on Boston/slot 0 both days, but a
+non-event drug may show today and be missing tomorrow purely from the fresh
+`rand%3` roll. **Planning consequence:** a prospective non-event buy/sell in the
+city you'll be in next day is only available with prob **2/3** — the MC layer
+should sample this as genuine execution risk (an event-active drug is always
+available). `stock.is_listed` already encodes `event or rand%3!=0`; only its
+*scope* (drawn for all 255 markets vs. current-city-only) is the seed-sync gap.
 
 ## 10. Corrections to apply (pending, after §9 resolves)
 1. `simulator._roll_event`: replace `rand_mod(100)` + 70/90 with `rand_mod(10)`
