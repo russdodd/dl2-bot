@@ -1904,6 +1904,20 @@ def match_current_city(market, matrix):
     return best
 
 
+def _norm_rank(rank):
+    """Map a Status-box rank string (often noisy, e.g. 'wannabe  v Sound', or
+    lower-cased) to a canonical rank in _C.RANKS, or None if it can't be matched."""
+    if not rank:
+        return None
+    low = rank.strip().lower()
+    for r in _C.RANKS:                       # substring match handles trailing OCR noise
+        if r.lower() in low or low.startswith(r.lower()):
+            return r
+    import difflib
+    m = difflib.get_close_matches(rank.strip(), _C.RANKS, n=1, cutoff=0.6)
+    return m[0] if m else None
+
+
 def _mc_state(current_key, matrix, qtys, market, status, capacity):
     """Assemble the planner state from the SAME OCR parse the sweep already built —
     no re-OCR, no new screen-driving. Normalizes matrix keys ("Boston, USA") to the
@@ -1940,11 +1954,17 @@ def _mc_state(current_key, matrix, qtys, market, status, capacity):
         state["bank"] = int(status["bank"])
     if status.get("debt") is not None:
         state["debt"] = int(status["debt"])
-    if capacity:
-        state["capacity"] = int(capacity)
-    rank = status.get("rank")
-    if rank in _C.RANK_CAPACITY:            # only pass a rank the model recognizes
+    # Carry capacity is the binding constraint on each fly/carry hop, so it must be
+    # the REAL rank tier — NOT the sweep's "unlimited" 20000 fallback (which assumes
+    # ship-in-batches and would fabricate a huge EV for a low-rank player). Prefer
+    # the parsed rank's tier; else a plausibly-real sweep read (< the top tier);
+    # else let the planner derive it from wealth.
+    rank = _norm_rank(status.get("rank"))
+    if rank:
         state["rank"] = rank
+        state["capacity"] = _C.RANK_CAPACITY[rank]
+    elif capacity and int(capacity) < _C.RANK_CAPACITY[_C.RANKS[-1]]:
+        state["capacity"] = int(capacity)
     return state
 
 
