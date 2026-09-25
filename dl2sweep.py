@@ -32,6 +32,7 @@ from dl2model import stock as _stock         # remote-stock estimate
 from dl2model import finance as _finance     # rank -> capacity, loan math
 from dl2model import strategy as _strategy    # loan-to-promote evaluation
 from dl2model import risk as _risk           # carry-vs-ship channel advisory
+from dl2model import planner as _planner     # state-conditioned MC receding-horizon plan
 from dl2model import constants as _C
 try:
     import digits                       # exact fixed-font digit reader (needs numpy)
@@ -1903,9 +1904,116 @@ def match_current_city(market, matrix):
     return best
 
 
+def _mc_state(current_key, matrix, qtys, market, status, capacity):
+    """Assemble the planner state from the SAME OCR parse the sweep already built —
+    no re-OCR, no new screen-driving. Normalizes matrix keys ("Boston, USA") to the
+    canonical short names dl2model uses ("Boston") and keeps only cities/drugs the
+    exact model knows. Returns the state dict, or None if it's too incomplete to
+    plan on (the caller then degrades silently)."""
+    short = lambda k: k.split(",")[0]
+    cur = short(current_key)
+    if cur not in _C.CITIES:
+        return None
+    prices, stock = {}, {}
+    for city_key, row in matrix.items():
+        cs = short(city_key)
+        if cs not in _C.CITIES:
+            continue
+        prow = {d: int(p) for d, p in row.items() if d in _C.DRUGS and p}
+        if prow:
+            prices[cs] = prow
+        qrow = qtys.get(city_key) or {}
+        srow = {d: int(q) for d, q in qrow.items() if d in _C.DRUGS and q is not None}
+        if srow:
+            stock[cs] = srow
+    if cur not in prices:
+        return None
+    mkt = {d: {"price": int(v["price"]), "qty": v.get("qty")}
+           for d, v in (market or {}).items() if d in _C.DRUGS and v.get("price")}
+    state = {"current_city": cur, "prices": prices, "stock": stock, "market": mkt,
+             "inventory": []}
+    cash = status.get("cash")
+    # The buy leg is cash-capped like the live view; fall back to "unlimited" when
+    # the Status box didn't read (the sweep still shows the observed prices above).
+    state["cash"] = int(cash) if cash is not None else 10 ** 12
+    if status.get("bank") is not None:
+        state["bank"] = int(status["bank"])
+    if status.get("debt") is not None:
+        state["debt"] = int(status["debt"])
+    if capacity:
+        state["capacity"] = int(capacity)
+    rank = status.get("rank")
+    if rank in _C.RANK_CAPACITY:            # only pass a rank the model recognizes
+        state["rank"] = rank
+    return state
+
+
+def _print_mc_plan(current_key, matrix, qtys, market, status, capacity, horizon, n):
+    """ADDED advisory view beneath the observed sweep: the top day-1 action from the
+    state-conditioned Monte-Carlo planner, with EV / p10-p50-p90 / p_loss. Never
+    replaces or hides an observed price; degrades silently on any failure."""
+    try:
+        state = _mc_state(current_key, matrix, qtys, market, status, capacity)
+        if state is None:
+            print("  (MC planner skipped: observed state incomplete for the model.)",
+                  file=sys.stderr)
+            return
+        # Can't plan past the end of the game: cap the horizon to days remaining.
+        h = horizon
+        if status.get("day") is not None and status.get("total_days") is not None:
+            remaining = status["total_days"] - status["day"]
+            if remaining >= 1:
+                h = min(horizon, remaining)
+        res = _planner.plan_mc(state, horizon=h, n=n)
+        best = res["best"]
+        if not best:
+            return
+    except Exception as e:                  # never let the advisory break the sweep
+        print(f"  (MC planner unavailable: {e})", file=sys.stderr)
+        return
+
+    def _pct(c):
+        return (f"p10 ${c['p10']:,.0f}  p50 ${c['p50']:,.0f}  p90 ${c['p90']:,.0f}"
+                f"  p(loss) {c['p_loss']:.0%}")
+
+    print("\n" + "=" * 66)
+    print(f"MONTE-CARLO PLANNER — ADDED view (horizon {res['horizon']} days, "
+          f"{res['n']} sims/candidate)")
+    print("=" * 66)
+    print("  State-conditioned rollout: samples futures matching the observed prices")
+    print("  (+ any rumors), decays spikes, and prices in the 2/3 listing risk.")
+    print("  EV is expected PROFIT (Δ cash+bank−debt). ADVISORY — the observed sweep")
+    print("  above is unchanged; this does not auto-act.")
+    print(f"\n  ➤ DAY-1 MOVE: {best['label']}")
+    print(f"       EV ${best['ev']:,.0f}   ({_pct(best)})")
+    runners = [c for c in res["candidates"][1:] if c["label"] != best["label"]][:2]
+    if runners:
+        print("  Runner(s)-up:")
+        for c in runners:
+            print(f"     - {c['label']}: EV ${c['ev']:,.0f}   ({_pct(c)})")
+    print(f"\n  ↻ Re-run `dl2 plan --horizon {horizon}` TOMORROW after you act. Receding")
+    print("    horizon: only day 1 is executed; the plan is re-derived on fresh prices")
+    print("    each day, so a spike that has bled out or a rumor that fired self-corrects.")
+    if not state["market"]:
+        print("  (note: current-city buy prices were unread, so buy-arb legs may be thin.)",
+              file=sys.stderr)
+
+
 def main():
     args = sys.argv[1:]
     override_cap = int(args[args.index("--capacity") + 1]) if "--capacity" in args else None
+    mc_horizon = None
+    if "--horizon" in args:
+        try:
+            mc_horizon = max(1, int(args[args.index("--horizon") + 1]))
+        except (ValueError, IndexError):
+            sys.exit("usage: dl2 plan --horizon N   (N = planning days, e.g. 3)")
+    mc_sims = _planner.DEFAULT_N
+    if "--sims" in args:
+        try:
+            mc_sims = max(1, int(args[args.index("--sims") + 1]))
+        except (ValueError, IndexError):
+            sys.exit("usage: dl2 plan --horizon N [--sims M]")
 
     # Ensure the world window is open for the sweep (works from either starting window).
     if not world_is_open():
@@ -1952,6 +2060,13 @@ def main():
     if header:
         print(header + "\n")
     print(optimizer.format_plan(state, optimizer.optimize(state), unlimited=True))
+
+    # ADDED: state-conditioned Monte-Carlo multi-day view (only with --horizon N;
+    # default off -> behavior unchanged). Placed here so it always prints, before
+    # the shipping step's possible early returns. Reuses the sweep's OCR — no re-OCR.
+    if mc_horizon is not None:
+        _print_mc_plan(current_key, matrix, qtys, market, status, capacity,
+                       mc_horizon, mc_sims)
 
     if "--no-ship" in args:
         return

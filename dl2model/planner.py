@@ -87,6 +87,7 @@ def candidate_actions(state):
     capacity = int(state.get("capacity") or finance.capacity_for_rank(rank))
     rumors = state.get("rumors") or []
     buy_prices, buy_stock = _buy_side(state)
+    has_held = bool(_held(state))
 
     cands = []
     for dest in cities:
@@ -101,8 +102,12 @@ def candidate_actions(state):
             top = max(loads, key=lambda l: (l["unit_value"] - l["unit_cost"]) * l["qty"])
             label = (f"{verb} {dest}: buy {top['qty']:,} {top['drug']} "
                      f"@ ${top['unit_cost']:,}" + ("" if len(buys) == 1 else " (+more)"))
+        elif has_held:
+            label = f"{verb} {dest}: sell held inventory there"
+        elif dest == current:
+            label = f"stay in {dest}: hold, then trade from here"
         else:
-            label = f"{verb} {dest}: sell held, no buy"
+            label = f"fly to {dest}: reposition (cheaper stock), then trade from there"
         cands.append({"dest": dest, "buys": buys, "label": label})
     return cands
 

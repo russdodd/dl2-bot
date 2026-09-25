@@ -1,6 +1,8 @@
 #!/bin/zsh
 # dl2 — Drug Lord 2 trade assistant.
 #   dl2 plan       full sweep of every city/drug -> the single best trade (recommended)
+#   dl2 plan --horizon N   also print a Monte-Carlo multi-day day-1 recommendation
+#                          (added advisory view; default off, sweep unchanged)
 #   dl2 decide     what to do with your inventory (uses the cached shipping-rate store)
 #   dl2 loan       read loan sharks; `loan borrow <shark> <amt>` / `loan repay [shark]` (full)
 #   dl2 shiprates  print the persistent origin->dest shipping-rate store + gaps
